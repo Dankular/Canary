@@ -1,0 +1,6 @@
+legacy/
+target/
+pkg/
+node_modules/
+dist/
+*.wasm

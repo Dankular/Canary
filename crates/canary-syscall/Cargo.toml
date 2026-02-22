@@ -1,0 +1,10 @@
+[package]
+name = "canary-syscall"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+log.workspace = true
+canary-memory = { path = "../canary-memory" }
+canary-fs     = { path = "../canary-fs" }

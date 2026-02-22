@@ -1,0 +1,9 @@
+[package]
+name = "canary-memory"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+log.workspace = true
+bitflags.workspace = true

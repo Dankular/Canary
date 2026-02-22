@@ -1,0 +1,25 @@
+{
+  "name": "canary",
+  "version": "0.1.0",
+  "description": "x86-64 Linux ELF emulator in WebAssembly — the 64-bit successor to CheerpX",
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types":   "./src/index.ts",
+      "import":  "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "build:wasm": "wasm-pack build ../crates/canary-wasm --target web --out-dir pkg",
+    "build":      "npm run build:wasm && tsc",
+    "dev":        "vite serve .",
+    "typecheck":  "tsc --noEmit"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "typescript": "^5.4",
+    "vite": "^5.2",
+    "wasm-pack": "^0.13"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "name": "canary-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": ["js"],
+  "scripts": {
+    "build":     "npm run build --workspace=js",
+    "build:wasm":"wasm-pack build crates/canary-wasm --target web --out-dir pkg",
+    "typecheck": "npm run typecheck --workspace=js"
+  }
+}

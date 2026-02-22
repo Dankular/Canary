@@ -1,0 +1,26 @@
+[package]
+name = "canary-wasm"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen.workspace = true
+js-sys.workspace = true
+web-sys.workspace = true
+log.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+canary-elf      = { path = "../canary-elf" }
+canary-cpu      = { path = "../canary-cpu" }
+canary-memory   = { path = "../canary-memory" }
+canary-syscall  = { path = "../canary-syscall" }
+canary-fs       = { path = "../canary-fs" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

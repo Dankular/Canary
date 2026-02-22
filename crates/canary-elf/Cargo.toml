@@ -1,0 +1,9 @@
+[package]
+name = "canary-elf"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+log.workspace = true
+bitflags.workspace = true
