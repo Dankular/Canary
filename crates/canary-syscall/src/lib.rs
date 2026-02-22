@@ -15,6 +15,25 @@ pub use dispatch::handle_syscall;
 
 use thiserror::Error;
 
+/// Information about a pending `clone` syscall that the JS runtime must act on
+/// by spawning a new Web Worker.
+#[derive(Debug, Clone)]
+pub struct CloneInfo {
+    /// The flags passed to clone(2).
+    pub flags: u64,
+    /// The child stack pointer (RSP for the new thread).
+    pub child_stack: u64,
+    /// Pointer in parent's address space for CLONE_PARENT_SETTID.
+    pub parent_tidptr: u64,
+    /// Pointer in child's address space for CLONE_CHILD_SETTID /
+    /// CLONE_CHILD_CLEARTID.
+    pub child_tidptr: u64,
+    /// TLS pointer passed via CLONE_SETTLS (new fs_base for the child).
+    pub tls: u64,
+    /// The TID that was allocated for the new thread.
+    pub new_tid: u32,
+}
+
 #[derive(Debug, Error)]
 pub enum SyscallError {
     #[error("memory error: {0}")]
@@ -25,6 +44,25 @@ pub enum SyscallError {
     Exit(i32),
     #[error("unimplemented syscall {0}")]
     Unimplemented(u64),
+    #[error("execve: {path}")]
+    ExecveRequest {
+        path: String,
+        argv: Vec<String>,
+        envp: Vec<String>,
+    },
+    /// Emitted by the clone handler so `canary-wasm` can spawn a Worker.
+    #[error("clone request: new tid {new_tid}")]
+    CloneRequest {
+        flags:         u64,
+        child_stack:   u64,
+        parent_tidptr: u64,
+        child_tidptr:  u64,
+        tls:           u64,
+        new_tid:       u32,
+    },
+    /// Bad guest address in a syscall argument.
+    #[error("fault at address {0:#x}")]
+    Fault(u64),
 }
 
 /// Linux errno values (negated into RAX on error).
@@ -55,4 +93,5 @@ pub mod errno {
     pub const ELOOP:  i64 = 40;
     pub const EOVERFLOW: i64 = 75;
     pub const ENOSPC: i64 = 28;
+    pub const ETIMEDOUT: i64 = 110;
 }

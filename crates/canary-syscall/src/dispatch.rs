@@ -2,9 +2,46 @@
 
 use canary_memory::{GuestMemory, Prot, MapFlags};
 use canary_fs::Vfs;
-use crate::{numbers::*, errno::*, SyscallError};
+use crate::{numbers::*, errno::*, SyscallError, CloneInfo};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+// ── Signal infrastructure ─────────────────────────────────────────────────────
+
+/// Per-signal handler registration (mirrors Linux kernel_sigaction).
+#[derive(Clone, Copy, Default)]
+pub struct SignalHandler {
+    /// Virtual address of the handler.
+    /// 0 = SIG_DFL, 1 = SIG_IGN, anything else = real handler VA.
+    pub handler_va: u64,
+    pub flags:      u64,
+    pub sa_mask:    u64,
+    /// Address of the signal restorer (__restore_rt in glibc).
+    pub restorer:   u64,
+}
+
+/// All signal-related state for the emulated process.
+pub struct SignalState {
+    /// Registered signal handlers: index = signum - 1.
+    pub handlers: [SignalHandler; 64],
+    /// Pending signal bitmap: bit N set means signal N+1 is pending.
+    pub pending:  u64,
+    /// Blocked signal mask: bit N set means signal N+1 is blocked.
+    pub mask:     u64,
+    /// Alternate signal stack (ss_sp, ss_size), if set by sigaltstack.
+    pub altstack: Option<(u64, usize)>,
+}
+
+impl Default for SignalState {
+    fn default() -> Self {
+        SignalState {
+            handlers: [SignalHandler::default(); 64],
+            pending:  0,
+            mask:     0,
+            altstack: None,
+        }
+    }
+}
 
 // ── File descriptor table ─────────────────────────────────────────────────────
 
@@ -12,6 +49,8 @@ pub struct FdTable {
     /// fd → (inode, offset, flags)
     fds: HashMap<u64, OpenFd>,
     next_fd: u64,
+    /// Set of fds that map to the /dev/fb0 framebuffer device.
+    fb_fds: HashSet<u64>,
 }
 
 struct OpenFd {
@@ -22,7 +61,7 @@ struct OpenFd {
 
 impl FdTable {
     pub fn new() -> Self {
-        let mut t = FdTable { fds: HashMap::new(), next_fd: 3 };
+        let mut t = FdTable { fds: HashMap::new(), next_fd: 3, fb_fds: HashSet::new() };
         // stdin=0, stdout=1, stderr=2 are pre-opened.
         for fd in 0..3u64 {
             t.fds.insert(fd, OpenFd { ino: 0, offset: 0, flags: 0 });
@@ -35,37 +74,88 @@ impl FdTable {
         self.fds.insert(fd, OpenFd { ino, offset: 0, flags });
         fd
     }
+    /// Allocate a framebuffer fd (backed by a sentinel inode 0).
+    pub fn alloc_fb(&mut self) -> u64 {
+        let fd = self.next_fd;
+        self.next_fd += 1;
+        self.fds.insert(fd, OpenFd { ino: 0, offset: 0, flags: 0 });
+        self.fb_fds.insert(fd);
+        fd
+    }
+    /// Returns true if `fd` refers to the /dev/fb0 framebuffer.
+    pub fn is_framebuffer(&self, fd: u64) -> bool {
+        self.fb_fds.contains(&fd)
+    }
     fn get(&self, fd: u64) -> Option<&OpenFd> { self.fds.get(&fd) }
     fn get_mut(&mut self, fd: u64) -> Option<&mut OpenFd> { self.fds.get_mut(&fd) }
-    fn close(&mut self, fd: u64) -> bool { self.fds.remove(&fd).is_some() }
+    fn close(&mut self, fd: u64) -> bool {
+        self.fb_fds.remove(&fd);
+        self.fds.remove(&fd).is_some()
+    }
 }
 
 // ── Syscall context ────────────────────────────────────────────────────────────
 
 pub struct SyscallCtx {
-    pub fds:  FdTable,
-    pub vfs:  Vfs,
-    pub cwd:  String,
+    pub fds:     FdTable,
+    pub vfs:     Vfs,
+    pub cwd:     String,
     /// stdout/stderr capture buffer (for the JS layer to read).
     pub stdout_buf: Vec<u8>,
     pub stderr_buf: Vec<u8>,
-    /// stdin provider — a closure that provides bytes.
-    pub pid:  u32,
-    pub uid:  u32,
-    pub gid:  u32,
+    pub pid:     u32,
+    pub uid:     u32,
+    pub gid:     u32,
+    /// Signal delivery state.
+    pub signals: SignalState,
+    /// Linux /dev/fb0 framebuffer device state.
+    pub fb: canary_fb::Framebuffer,
+    // ── Threading ─────────────────────────────────────────────────────────
+    /// All spawned threads (the main thread itself is not stored here; its
+    /// registers live in `CanaryRuntime::cpu`).
+    pub threads: canary_thread::ThreadTable,
+    /// TID of the currently-executing thread.  Main thread = 1.
+    pub current_tid: canary_thread::ThreadId,
+    /// Queue of clone requests that the JS harness must act on by spawning
+    /// Web Workers.  Drained by `CanaryRuntime::drain_clone_requests()`.
+    pub pending_clone: Vec<CloneInfo>,
+    // ── Networking ────────────────────────────────────────────────────────
+    /// Virtual socket table and JS bridge queues.
+    pub net: canary_net::NetCtx,
 }
 
 impl SyscallCtx {
     pub fn new() -> Self {
+        let mut vfs = Vfs::new();
+        // Pre-populate device stubs so that open() succeeds for these paths.
+        vfs.mem.write_file("/dev/fb0",            vec![]).ok();
+        vfs.mem.write_file("/dev/input/event0",   vec![]).ok();
+        vfs.mem.write_file("/dev/input/mice",     vec![]).ok();
+        vfs.mem.write_file("/dev/dri/card0",      vec![]).ok();
+        vfs.mem.write_file("/dev/dri/renderD128", vec![]).ok();
+        // Pre-populate DNS/hosts stubs for libc name resolution.
+        vfs.mem.write_file("/etc/hosts",
+            b"127.0.0.1 localhost\n::1 localhost\n".to_vec()).ok();
+        vfs.mem.write_file("/etc/resolv.conf",
+            b"nameserver 127.0.0.1\n".to_vec()).ok();
+        vfs.mem.write_file("/etc/nsswitch.conf",
+            b"hosts: files dns\n".to_vec()).ok();
+
         SyscallCtx {
-            fds:  FdTable::new(),
-            vfs:  Vfs::new(),
-            cwd:  "/".to_string(),
-            stdout_buf: Vec::new(),
-            stderr_buf: Vec::new(),
-            pid:  1,
-            uid:  1000,
-            gid:  1000,
+            fds:           FdTable::new(),
+            vfs,
+            cwd:           "/".to_string(),
+            stdout_buf:    Vec::new(),
+            stderr_buf:    Vec::new(),
+            pid:           1,
+            uid:           1000,
+            gid:           1000,
+            signals:       SignalState::default(),
+            fb:            canary_fb::Framebuffer::new(),
+            threads:       canary_thread::ThreadTable::new(1),
+            current_tid:   1,
+            pending_clone: Vec::new(),
+            net:           canary_net::NetCtx::new(),
         }
     }
 }
@@ -89,6 +179,14 @@ pub fn handle_syscall(
 ) -> Result<i64, SyscallError> {
 
     log::debug!("syscall {} ({:#x}), args: {:#x} {:#x} {:#x} {:#x}", nr, nr, a0, a1, a2, a3);
+
+    // ── Network socket syscalls ────────────────────────────────────────────────
+    // These are handled entirely in canary-net, before the main match.
+    if canary_net::syscalls::is_socket_syscall(nr) {
+        return Ok(canary_net::syscalls::handle_socket_syscall(
+            nr, a0, a1, a2, a3, a4, a5, mem, &mut ctx.net,
+        ));
+    }
 
     let ret: i64 = match nr {
 
@@ -150,6 +248,10 @@ pub fn handle_syscall(
             let flags    = if nr == SYS_CREAT { O_CREAT | O_WRONLY | O_TRUNC } else { a1 };
             let path     = mem.read_cstr(path_ptr)?;
             let abs      = resolve_path(&ctx.cwd, &path);
+            // Intercept /dev/fb0 — return a framebuffer fd.
+            if abs == "/dev/fb0" {
+                return Ok(ctx.fds.alloc_fb() as i64);
+            }
             match ctx.vfs.mem.lookup(&abs) {
                 Ok(ino) => {
                     let fd = ctx.fds.alloc(ino, flags);
@@ -179,6 +281,10 @@ pub fn handle_syscall(
                 // Resolve relative to dirfd — simplified.
                 resolve_path(&ctx.cwd, &path)
             };
+            // Intercept /dev/fb0 — return a framebuffer fd.
+            if abs == "/dev/fb0" {
+                return Ok(ctx.fds.alloc_fb() as i64);
+            }
             match ctx.vfs.mem.lookup(&abs) {
                 Ok(ino) => {
                     let fd = ctx.fds.alloc(ino, flags);
@@ -258,6 +364,25 @@ pub fn handle_syscall(
             let fd     = a4 as i64;
             let off    = a5 as usize;
 
+            // Check if this mmap is for /dev/fb0.
+            if fd >= 0 && ctx.fds.is_framebuffer(fd as u64) {
+                // Map the framebuffer pixel buffer at the requested (or default) address.
+                let fb_addr = if addr != 0 { addr } else { canary_fb::FB_MMAP_ADDR };
+                let fb_size = canary_fb::FB_SIZE as u64;
+                return Ok(match mem.mmap(
+                    fb_addr,
+                    fb_size,
+                    Prot::READ | Prot::WRITE,
+                    MapFlags::FIXED | MapFlags::PRIVATE | MapFlags::ANONYMOUS,
+                ) {
+                    Ok(mapped) => {
+                        ctx.fb.mmap_addr = Some(mapped);
+                        mapped as i64
+                    }
+                    Err(_) => -ENOMEM,
+                });
+            }
+
             match mem.mmap(addr, length, prot, flags) {
                 Ok(mapped) => {
                     // If fd >= 0, load file content from offset into mapped address.
@@ -308,15 +433,66 @@ pub fn handle_syscall(
         // ── getpid / gettid ───────────────────────────────────────────────
         SYS_GETPID  => ctx.pid as i64,
         SYS_GETPPID => 0,
-        SYS_GETTID  => ctx.pid as i64,
+        // gettid returns the current thread's TID, not the process PID.
+        SYS_GETTID  => ctx.current_tid as i64,
 
         // ── getuid / geteuid / getgid / getegid ───────────────────────────
         SYS_GETUID  | SYS_GETEUID => ctx.uid as i64,
         SYS_GETGID  | SYS_GETEGID => ctx.gid as i64,
 
-        // ── rt_sigaction (stub — we don't deliver signals) ────────────────
-        SYS_RT_SIGACTION | SYS_RT_SIGPROCMASK | SYS_SET_ROBUST_LIST
-        | SYS_GET_ROBUST_LIST => 0,
+        // ── rt_sigaction(signum, new_sa, old_sa, sigsetsize) ─────────────
+        SYS_RT_SIGACTION => {
+            let signum  = a0 as usize;
+            if signum < 1 || signum > 64 { return Ok(-EINVAL); }
+            let idx     = signum - 1;
+            let new_ptr = a1;
+            let old_ptr = a2;
+            // Write out old handler if requested.
+            if old_ptr != 0 {
+                let h = &ctx.signals.handlers[idx];
+                mem.write_u64(old_ptr,      h.handler_va)?;
+                mem.write_u64(old_ptr +  8, h.flags)?;
+                mem.write_u64(old_ptr + 16, h.restorer)?;
+                mem.write_u64(old_ptr + 24, h.sa_mask)?;
+            }
+            // Install new handler if requested.
+            if new_ptr != 0 {
+                let handler_va = mem.read_u64(new_ptr)?;
+                let flags      = mem.read_u64(new_ptr +  8)?;
+                let restorer   = mem.read_u64(new_ptr + 16)?;
+                let sa_mask    = mem.read_u64(new_ptr + 24)?;
+                ctx.signals.handlers[idx] = SignalHandler { handler_va, flags, sa_mask, restorer };
+            }
+            0
+        }
+
+        // ── rt_sigprocmask(how, set_ptr, oldset_ptr, sigsetsize) ─────────
+        SYS_RT_SIGPROCMASK => {
+            let how     = a0;
+            let set_ptr = a1;
+            let old_ptr = a2;
+            // SIG_BLOCK=0, SIG_UNBLOCK=1, SIG_SETMASK=2
+            if old_ptr != 0 {
+                mem.write_u64(old_ptr, ctx.signals.mask)?;
+            }
+            if set_ptr != 0 {
+                let new_set = mem.read_u64(set_ptr)?;
+                match how {
+                    0 => ctx.signals.mask |= new_set,   // SIG_BLOCK
+                    1 => ctx.signals.mask &= !new_set,  // SIG_UNBLOCK
+                    2 => ctx.signals.mask  = new_set,   // SIG_SETMASK
+                    _ => return Ok(-EINVAL),
+                }
+            }
+            0
+        }
+
+        // ── rt_sigreturn — restore registers from ucontext on stack ───────
+        // (Handled specially in canary-wasm; if we somehow reach here, no-op.)
+        SYS_RT_SIGRETURN => 0,
+
+        // ── robust-list stubs ─────────────────────────────────────────────
+        SYS_SET_ROBUST_LIST | SYS_GET_ROBUST_LIST => 0,
 
         // ── uname ─────────────────────────────────────────────────────────
         SYS_UNAME => {
@@ -396,15 +572,22 @@ pub fn handle_syscall(
             0
         }
 
-        // ── ioctl (terminal size, tty) ─────────────────────────────────────
+        // ── ioctl (terminal size, tty, framebuffer) ───────────────────────
         SYS_IOCTL => {
-            match a1 {
+            let ioctl_fd  = a0;
+            let ioctl_cmd = a1;
+            let ioctl_arg = a2;
+            // Route framebuffer ioctls to the FB handler.
+            if ctx.fds.is_framebuffer(ioctl_fd) {
+                return Ok(ctx.fb.ioctl(ioctl_cmd, ioctl_arg, mem));
+            }
+            match ioctl_cmd {
                 TIOCGWINSZ => {
                     // struct winsize: ws_row, ws_col, ws_xpixel, ws_ypixel (u16 each)
-                    mem.write_u16(a2,      24)?;  // rows
-                    mem.write_u16(a2 + 2,  80)?;  // cols
-                    mem.write_u16(a2 + 4,   0)?;
-                    mem.write_u16(a2 + 6,   0)?;
+                    mem.write_u16(ioctl_arg,      24)?;  // rows
+                    mem.write_u16(ioctl_arg + 2,  80)?;  // cols
+                    mem.write_u16(ioctl_arg + 4,   0)?;
+                    mem.write_u16(ioctl_arg + 6,   0)?;
                     0
                 }
                 TCGETS | TCSETS => 0,
@@ -413,18 +596,44 @@ pub fn handle_syscall(
         }
 
         // ── futex (WAIT/WAKE) ─────────────────────────────────────────────
+        // a0 = uaddr, a1 = futex_op, a2 = val, a3 = timeout_ptr (WAIT) or
+        //   val2 (WAKE), a4 = uaddr2, a5 = val3.
         SYS_FUTEX => {
-            let op = a1 & 0x7F;
+            let uaddr = a0;
+            let op    = (a1 & 0x7f) as u32;
+            let val   = a2 as i32;
+
+            const FUTEX_WAIT_OP:  u32 = 0;
+            const FUTEX_WAKE_OP:  u32 = 1;
+            const FUTEX_WAIT_POP: u32 = 128;    // FUTEX_WAIT | FUTEX_PRIVATE_FLAG
+            const FUTEX_WAKE_POP: u32 = 129;    // FUTEX_WAKE | FUTEX_PRIVATE_FLAG
+
             match op {
-                FUTEX_WAIT | FUTEX_WAIT_PRIVATE => {
-                    // Check if value matches; if so "wait" (just return).
-                    let val = mem.read_u32(a0)? as u64;
-                    if val == a2 { 0 } else { -EAGAIN }
+                FUTEX_WAIT_OP | FUTEX_WAIT_POP => {
+                    // Read the 32-bit futex word at uaddr.
+                    let current = mem.read_i32(uaddr)
+                        .map_err(|_| SyscallError::Fault(uaddr))?;
+                    if current != val {
+                        // Value already changed — caller must retry.
+                        return Ok(-EAGAIN);
+                    }
+                    // In single-threaded (or cooperative) mode the main WASM
+                    // thread cannot truly block.  Return EAGAIN so that glibc's
+                    // pthread_mutex_lock spin loop backs off and retries; the JS
+                    // scheduler can interleave other threads between steps.
+                    // Worker threads will use Atomics.wait() on the JS side
+                    // directly and never reach this path.
+                    -EAGAIN
                 }
-                FUTEX_WAKE | FUTEX_WAKE_PRIVATE => {
-                    0 // 0 waiters woken (single-threaded)
+                FUTEX_WAKE_OP | FUTEX_WAKE_POP => {
+                    // val = maximum number of waiters to wake.
+                    // We don't track waiters in Rust — return 0 (no waiters
+                    // found here; Atomics.notify() on the JS side handles the
+                    // real wakeup for Worker threads).
+                    let _wake_count = a2; // how many to wake (ignored in stub)
+                    0
                 }
-                _ => -ENOSYS,
+                _ => -EINVAL,
             }
         }
 
@@ -436,22 +645,13 @@ pub fn handle_syscall(
 
         // ── mremap ───────────────────────────────────────────────────────
         SYS_MREMAP => {
-            // Simplified: allocate new region, copy, unmap old.
             let old_addr = a0;
             let old_size = a1;
             let new_size = a2;
-            let _flags   = a3;
-            match mem.mmap(0, new_size, Prot::READ | Prot::WRITE, MapFlags::PRIVATE | MapFlags::ANONYMOUS) {
-                Ok(new_addr) => {
-                    let copy_size = old_size.min(new_size) as usize;
-                    if let Ok(src) = mem.read_bytes(old_addr, copy_size) {
-                        let src = src.to_vec();
-                        mem.write_bytes_at(new_addr, &src).ok();
-                    }
-                    mem.munmap(old_addr, old_size).ok();
-                    new_addr as i64
-                }
-                Err(_) => -ENOMEM,
+            let flags    = a3 as u32;
+            match mem.mremap(old_addr, old_size, new_size, flags) {
+                Ok(new_addr) => new_addr as i64,
+                Err(_)       => -ENOMEM,
             }
         }
 
@@ -721,26 +921,152 @@ pub fn handle_syscall(
             0
         }
 
-        // ── kill (stub) ───────────────────────────────────────────────────
-        SYS_KILL => 0,
+        // ── kill(pid, signum) ─────────────────────────────────────────────
+        SYS_KILL => {
+            let signum = a1 as i32;
+            if signum == 0 { return Ok(0); }          // existence check only
+            if signum < 1 || signum > 64 { return Ok(-EINVAL); }
+            ctx.signals.pending |= 1u64 << (signum - 1);
+            0
+        }
+
+        // ── tkill(tid, signum) ────────────────────────────────────────────
+        SYS_TKILL => {
+            let signum = a1 as i32;
+            if signum == 0 { return Ok(0); }
+            if signum < 1 || signum > 64 { return Ok(-EINVAL); }
+            ctx.signals.pending |= 1u64 << (signum - 1);
+            0
+        }
+
+        // ── tgkill(tgid, tid, signum) ─────────────────────────────────────
+        SYS_TGKILL => {
+            let signum = a2 as i32;
+            if signum == 0 { return Ok(0); }
+            if signum < 1 || signum > 64 { return Ok(-EINVAL); }
+            ctx.signals.pending |= 1u64 << (signum - 1);
+            0
+        }
 
         // ── wait4 (stub — no child processes) ────────────────────────────
         SYS_WAIT4 => -ECHILD,
 
-        // ── clone / fork (stubs) ─────────────────────────────────────────
-        SYS_CLONE | SYS_FORK => {
-            // Return ENOSYS; a single-threaded emulator can't fork.
-            -ENOSYS
+        // ── clone(flags, child_stack, ptidptr, ctidptr, tls) ─────────────
+        // x86-64 ABI:
+        //   a0 = flags, a1 = child_stack, a2 = parent_tidptr,
+        //   a3 = child_tidptr, a4 = tls
+        SYS_CLONE => {
+            let flags         = a0;
+            let child_stack   = a1;
+            let parent_tidptr = a2;
+            let child_tidptr  = a3;
+            let tls           = a4;
+
+            // Clone flag bits (prefixed with _ to suppress dead_code warnings
+            // for flags that are recorded in CloneInfo but not acted on here).
+            const CLONE_VM:              u64 = 0x0000_0100;
+            const _CLONE_THREAD:         u64 = 0x0001_0000;
+            const _CLONE_SETTLS:         u64 = 0x0008_0000;
+            const CLONE_PARENT_SETTID:   u64 = 0x0010_0000;
+            const _CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+            const _CLONE_CHILD_SETTID:   u64 = 0x0100_0000;
+
+            if flags & CLONE_VM == 0 {
+                // fork() or vfork() — we don't support process-level forking.
+                return Ok(-ENOSYS);
+            }
+
+            // Allocate a new TID for the child thread.
+            let new_tid = ctx.threads.alloc_tid();
+
+            // CLONE_PARENT_SETTID: write new_tid into parent's memory at
+            // parent_tidptr.
+            if flags & CLONE_PARENT_SETTID != 0 && parent_tidptr != 0 {
+                mem.write_u32(parent_tidptr, new_tid)
+                    .map_err(|_| SyscallError::Fault(parent_tidptr))?;
+            }
+
+            // Build a CloneInfo for the JS harness to act on, so it can spawn
+            // a Web Worker for this thread.
+            let info = CloneInfo {
+                flags,
+                child_stack,
+                parent_tidptr,
+                child_tidptr,
+                tls,
+                new_tid,
+            };
+            ctx.pending_clone.push(info);
+
+            // Return the new TID in the *parent* (the child will get 0 when
+            // its Worker is initialised by the JS harness).
+            new_tid as i64
         }
 
-        // ── execve (stub) ─────────────────────────────────────────────────
-        SYS_EXECVE => -ENOSYS,
+        // ── fork (not supported — use clone instead) ──────────────────────
+        SYS_FORK => -ENOSYS,
+
+        // ── execve(pathname, argv, envp) ──────────────────────────────────
+        SYS_EXECVE => {
+            let path = mem.read_cstr(a0)?;
+            // Read argv: array of u64 pointers, null-terminated.
+            let mut argv: Vec<String> = Vec::new();
+            let mut ptr = a1;
+            loop {
+                let p = mem.read_u64(ptr)?;
+                if p == 0 { break; }
+                argv.push(mem.read_cstr(p)?);
+                ptr += 8;
+            }
+            // Read envp similarly.
+            let mut envp: Vec<String> = Vec::new();
+            let mut ptr = a2;
+            loop {
+                let p = mem.read_u64(ptr)?;
+                if p == 0 { break; }
+                envp.push(mem.read_cstr(p)?);
+                ptr += 8;
+            }
+            return Err(SyscallError::ExecveRequest { path, argv, envp });
+        }
 
         // ── prctl (stub) ──────────────────────────────────────────────────
         SYS_PRCTL => 0,
 
-        // ── sigaltstack (stub) ────────────────────────────────────────────
-        SYS_SIGALTSTACK => 0,
+        // ── sigaltstack(ss, old_ss) ───────────────────────────────────────
+        // struct stack_t: ss_sp (u64), ss_flags (i32 padded to u64), ss_size (u64)
+        SYS_SIGALTSTACK => {
+            let new_ss = a0;
+            let old_ss = a1;
+            // Write old stack to *old_ss if requested.
+            if old_ss != 0 {
+                match ctx.signals.altstack {
+                    Some((sp, sz)) => {
+                        mem.write_u64(old_ss,      sp)?;
+                        mem.write_u64(old_ss + 8,  0)?;  // SS_ONSTACK/SS_DISABLE flags
+                        mem.write_u64(old_ss + 16, sz as u64)?;
+                    }
+                    None => {
+                        mem.write_u64(old_ss,      0)?;
+                        mem.write_u64(old_ss + 8,  2)?;  // SS_DISABLE = 2
+                        mem.write_u64(old_ss + 16, 0)?;
+                    }
+                }
+            }
+            // Install new stack if requested.
+            if new_ss != 0 {
+                let ss_sp    = mem.read_u64(new_ss)?;
+                let ss_flags = mem.read_u64(new_ss + 8)?;
+                let ss_size  = mem.read_u64(new_ss + 16)? as usize;
+                if ss_flags & 2 != 0 {
+                    // SS_DISABLE
+                    ctx.signals.altstack = None;
+                } else {
+                    ctx.signals.altstack = Some((ss_sp, ss_size));
+                }
+            }
+            0
+        }
 
         // ── prlimit64(pid, resource, new, old) ───────────────────────────
         SYS_PRLIMIT64 => {
@@ -755,9 +1081,12 @@ pub fn handle_syscall(
         // ── poll / select / pselect / ppoll (stubs) ──────────────────────
         SYS_POLL | SYS_SELECT | SYS_PSELECT6 | SYS_PPOLL => 0,
 
-        // ── socket / connect / send / recv stubs ─────────────────────────
-        SYS_SOCKET => -ENOSYS,
-        SYS_CONNECT | SYS_BIND | SYS_LISTEN | SYS_ACCEPT | SYS_ACCEPT4
+        // ── socket syscalls — handled above via canary_net early-return ──
+        // These arms are unreachable because is_socket_syscall() returns true
+        // for all of them and we return early above.  They are kept here only
+        // to prevent "unreachable pattern" warnings from the wildcard arm.
+        SYS_SOCKET | SYS_CONNECT | SYS_BIND | SYS_LISTEN
+        | SYS_ACCEPT | SYS_ACCEPT4
         | SYS_SENDTO | SYS_RECVFROM | SYS_SENDMSG | SYS_RECVMSG
         | SYS_SETSOCKOPT | SYS_GETSOCKOPT | SYS_GETSOCKNAME | SYS_GETPEERNAME
         | SYS_SOCKETPAIR | SYS_SENDMMSG | SYS_RECVMMSG => -ENOSYS,

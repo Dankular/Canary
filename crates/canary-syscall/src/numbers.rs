@@ -129,6 +129,11 @@ pub const SYS_TIMERFD_CREATE:  u64 = 283;
 pub const SYS_TIMERFD_SETTIME: u64 = 286;
 pub const SYS_TIMERFD_GETTIME: u64 = 287;
 
+// Signal-related syscalls
+pub const SYS_RT_SIGRETURN:    u64 = 15;
+pub const SYS_TKILL:           u64 = 200;
+pub const SYS_TGKILL:          u64 = 234;
+
 // arch_prctl codes
 pub const ARCH_SET_FS: u64 = 0x1002;
 pub const ARCH_GET_FS: u64 = 0x1003;

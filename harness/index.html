@@ -3,6 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Cross-Origin-Opener-Policy" content="same-origin">
+  <meta http-equiv="Cross-Origin-Embedder-Policy" content="require-corp">
   <title>Canary — x86-64 Linux in WASM</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -61,6 +63,8 @@
     <h1>Canary x86-64</h1>
     <span class="status" id="status-text">Initialising…</span>
   </header>
+  <canvas id="fb" width="1024" height="768"
+    style="display:none; border:1px solid #30363d; max-width:100%; margin:8px 16px; background:#000;"></canvas>
   <div id="terminal"></div>
   <footer>Canary — from-scratch x86-64 Linux ELF emulator in WebAssembly</footer>
 

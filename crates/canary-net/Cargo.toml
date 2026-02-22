@@ -1,0 +1,8 @@
+[package]
+name = "canary-net"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+canary-memory = { path = "../canary-memory" }
+thiserror     = { workspace = true }

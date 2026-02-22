@@ -6,6 +6,9 @@ use canary_memory::{GuestMemory, layout, Prot, MapFlags};
 use canary_cpu::{CpuState, decoder::decode, interpreter::{execute, ExecError}};
 use canary_syscall::dispatch::{SyscallCtx, handle_syscall};
 use canary_elf::auxv::{build_auxv, build_initial_stack};
+use canary_jit::{JitCache, JitResult};
+#[allow(unused_imports)]
+use canary_thread;
 
 // ── JS-side console logging ───────────────────────────────────────────────────
 
@@ -26,6 +29,7 @@ pub struct CanaryRuntime {
     cpu:  CpuState,
     mem:  GuestMemory,
     ctx:  SyscallCtx,
+    jit:  JitCache,
 }
 
 #[wasm_bindgen]
@@ -38,6 +42,7 @@ impl CanaryRuntime {
             cpu: CpuState::default(),
             mem: GuestMemory::new(layout::TOTAL_WASM_BYTES),
             ctx: SyscallCtx::new(),
+            jit: JitCache::new(),
         }
     }
 
@@ -177,6 +182,139 @@ impl CanaryRuntime {
             rip=self.cpu.rip, rflags=self.cpu.rflags,
         )
     }
+
+    // ── Framebuffer API ───────────────────────────────────────────────────
+
+    /// Returns the current framebuffer pixel data as a flat BGRA Uint8Array.
+    /// Returns an empty Vec if the framebuffer has not been mmap'd by the guest yet.
+    #[wasm_bindgen]
+    pub fn get_framebuffer(&self) -> Vec<u8> {
+        self.ctx.fb.read_pixels(&self.mem)
+            .map(|s| s.to_vec())
+            .unwrap_or_default()
+    }
+
+    /// Returns framebuffer dimensions as the string "{width},{height}".
+    #[wasm_bindgen]
+    pub fn get_fb_dimensions(&self) -> String {
+        format!("{},{}", canary_fb::FB_WIDTH, canary_fb::FB_HEIGHT)
+    }
+
+    /// Returns true if the guest has mmap'd /dev/fb0.
+    #[wasm_bindgen]
+    pub fn has_framebuffer(&self) -> bool {
+        self.ctx.fb.mmap_addr.is_some()
+    }
+
+    // ── Threading API ─────────────────────────────────────────────────────
+
+    /// Drain any pending `clone` requests and return them as a JSON array.
+    ///
+    /// Each element has the shape:
+    /// `{"tid":2,"child_stack":12345678,"tls":87654321,"child_tidptr":99,"flags":1234}`
+    ///
+    /// The JS harness should call this after every `step()` (or batch of steps)
+    /// and spawn a Web Worker for each entry, passing in the data so the Worker
+    /// can set up RSP = child_stack, fs_base = tls, and RAX = 0 (child return).
+    #[wasm_bindgen]
+    pub fn drain_clone_requests(&mut self) -> String {
+        let reqs = std::mem::take(&mut self.ctx.pending_clone);
+        if reqs.is_empty() {
+            return "[]".to_string();
+        }
+        let items: Vec<String> = reqs
+            .iter()
+            .map(|r| {
+                format!(
+                    r#"{{"tid":{},"child_stack":{},"tls":{},"child_tidptr":{},"flags":{}}}"#,
+                    r.new_tid, r.child_stack, r.tls, r.child_tidptr, r.flags
+                )
+            })
+            .collect();
+        format!("[{}]", items.join(","))
+    }
+
+    /// Return the current thread ID (used by the Worker harness to verify state).
+    #[wasm_bindgen]
+    pub fn current_tid(&self) -> u32 {
+        self.ctx.current_tid
+    }
+
+    /// Set the current thread ID.  Called by the Worker harness when initialising
+    /// a spawned thread so that `gettid()` returns the correct value.
+    #[wasm_bindgen]
+    pub fn set_current_tid(&mut self, tid: u32) {
+        self.ctx.current_tid = tid;
+    }
+
+    // ── Networking API ────────────────────────────────────────────────────
+
+    /// Drain any pending connect() requests.
+    ///
+    /// Returns a JSON array of `{"fd":N,"ip":"a.b.c.d","port":P}` objects.
+    /// JS should open a WebSocket to `ws://ip:port` for each entry, then call
+    /// `socket_connected(fd)` when the WebSocket opens and
+    /// `socket_recv_data(fd, bytes)` when data arrives.
+    #[wasm_bindgen]
+    pub fn drain_connect_requests(&mut self) -> String {
+        let reqs = std::mem::take(&mut self.ctx.net.pending_connect);
+        if reqs.is_empty() {
+            return "[]".to_string();
+        }
+        let items: Vec<String> = reqs
+            .iter()
+            .map(|c| {
+                format!(
+                    r#"{{"fd":{},"ip":"{}.{}.{}.{}","port":{}}}"#,
+                    c.fd, c.ip[0], c.ip[1], c.ip[2], c.ip[3], c.port
+                )
+            })
+            .collect();
+        format!("[{}]", items.join(","))
+    }
+
+    /// Drain any pending outbound socket data.
+    ///
+    /// Returns a JSON array of `{"fd":N,"data":"<base64>"}` objects.
+    /// JS should forward each chunk over the corresponding WebSocket.
+    #[wasm_bindgen]
+    pub fn drain_socket_sends(&mut self) -> String {
+        let sends = std::mem::take(&mut self.ctx.net.pending_sends);
+        if sends.is_empty() {
+            return "[]".to_string();
+        }
+        let items: Vec<String> = sends
+            .iter()
+            .map(|s| {
+                // Encode as base64 using the alphabet A-Za-z0-9+/
+                let b64 = base64_encode(&s.data);
+                format!(r#"{{"fd":{},"data":"{}"}}"#, s.fd, b64)
+            })
+            .collect();
+        format!("[{}]", items.join(","))
+    }
+
+    /// Called from JS when a connect() WebSocket successfully opens.
+    /// Transitions the socket from `Connecting` to `Connected`.
+    #[wasm_bindgen]
+    pub fn socket_connected(&mut self, fd: u64) {
+        if let Some(sock) = self.ctx.net.socks.get_mut(fd) {
+            sock.state = canary_net::SocketState::Connected;
+        }
+    }
+
+    /// Called from JS when data arrives on a socket's WebSocket.
+    /// Appends data to the socket's receive buffer so that `recvfrom` can read it.
+    #[wasm_bindgen]
+    pub fn socket_recv_data(&mut self, fd: u64, data: &[u8]) {
+        if let Some(sock) = self.ctx.net.socks.get_mut(fd) {
+            sock.recv_buf.extend(data.iter().copied());
+            // If we were waiting for the connection, mark it as established.
+            if sock.state == canary_net::SocketState::Connecting {
+                sock.state = canary_net::SocketState::Connected;
+            }
+        }
+    }
 }
 
 // ── Error type ────────────────────────────────────────────────────────────────
@@ -215,11 +353,17 @@ impl CanaryRuntime {
         // ── 2. Reset memory state for a fresh execution ───────────────────
         self.mem  = GuestMemory::new(layout::TOTAL_WASM_BYTES);
         self.cpu  = CpuState::default();
-        // Keep ctx.vfs (filesystem) but reset fds.
-        self.ctx.fds = canary_syscall::dispatch::FdTable::new();
-        self.ctx.cwd = "/".to_string();
+        self.jit  = JitCache::new();
+        // Keep ctx.vfs (filesystem) but reset fds and signal state.
+        self.ctx.fds     = canary_syscall::dispatch::FdTable::new();
+        self.ctx.cwd     = "/".to_string();
         self.ctx.stdout_buf.clear();
         self.ctx.stderr_buf.clear();
+        self.ctx.signals = canary_syscall::dispatch::SignalState::default();
+        // Reset threading state: main thread is always TID 1.
+        self.ctx.threads       = canary_thread::ThreadTable::new(1);
+        self.ctx.current_tid   = 1;
+        self.ctx.pending_clone = Vec::new();
 
         // ── 3. Map + load PT_LOAD segments for main ELF ───────────────────
         self.load_elf_segments(data, &elf)?;
@@ -331,11 +475,61 @@ impl CanaryRuntime {
     }
 
     fn step_once(&mut self) -> Result<(), CanaryError> {
+        // Check for deliverable signals before executing the next instruction.
+        self.deliver_pending_signals()?;
+
         let rip = self.cpu.rip;
+
+        // ── JIT cache lookup ──────────────────────────────────────────────
+        let block_hit = self.jit.get_mut(rip).is_some();
+        if block_hit {
+            let block = self.jit.get_mut(rip).unwrap();
+            block.hit_count += 1;
+            let result = JitCache::execute_block(block, &mut self.cpu, &mut self.mem);
+            return match result {
+                JitResult::Continue(_)  => Ok(()),
+                JitResult::Branch(_)    => Ok(()),
+                JitResult::Syscall(_)   => self.dispatch_syscall(),
+                JitResult::Halt         => Err(CanaryError::Exit(0)),
+                JitResult::Fault(e)     => Err(CanaryError::Exec(e)),
+            };
+        }
+
+        // ── JIT cache miss: try to compile this block ─────────────────────
+        if self.jit.compile(rip, &self.mem).is_some() {
+            let block = self.jit.get_mut(rip).unwrap();
+            block.hit_count += 1;
+            let result = JitCache::execute_block(block, &mut self.cpu, &mut self.mem);
+            match result {
+                JitResult::Continue(_)  => return Ok(()),
+                JitResult::Branch(_)    => return Ok(()),
+                JitResult::Syscall(_)   => return self.dispatch_syscall(),
+                JitResult::Halt         => return Err(CanaryError::Exit(0)),
+                JitResult::Fault(_)     => {
+                    // Fall through to the single-instruction interpreter for
+                    // faulting instructions (e.g. memory access on a tricky
+                    // address) so we get a precise per-instruction error.
+                }
+            }
+        }
+
+        // ── Interpreter fallback (single instruction) ─────────────────────
+        self.interpret_one()
+    }
+
+    /// Execute exactly one instruction via the pure interpreter.
+    /// This is the original `step_once` body, used as a fallback when the JIT
+    /// cannot compile or when a compiled block faults.
+    fn interpret_one(&mut self) -> Result<(), CanaryError> {
+        let rip = self.cpu.rip;
+        // Instruction fetch: try 15 bytes (max x86-64 instruction length).
+        // read_bytes() returns Err on cross-page reads; fall back to
+        // read_bytes_copy() which handles page boundaries, then try 1 byte.
         let bytes = self.mem.read_bytes(rip, 15)
-            .or_else(|_| self.mem.read_bytes(rip, 1))
-            .map_err(|e| CanaryError::Exec(format!("fetch @{rip:#x}: {e}")))?
-            .to_vec();
+            .map(|s| s.to_vec())
+            .or_else(|_| self.mem.read_bytes_copy(rip, 15))
+            .or_else(|_| self.mem.read_bytes_copy(rip, 1))
+            .map_err(|e| CanaryError::Exec(format!("fetch @{rip:#x}: {e}")))?;
 
         let instr = decode(&bytes, rip)
             .map_err(|e| CanaryError::Exec(format!("decode @{rip:#x}: {e}")))?;
@@ -363,6 +557,12 @@ impl CanaryRuntime {
         let a4  = self.cpu.gpr[reg::R8];
         let a5  = self.cpu.gpr[reg::R9];
 
+        // rt_sigreturn is handled entirely in the runtime, not in dispatch.rs,
+        // because it needs access to both cpu and mem simultaneously.
+        if nr == canary_syscall::numbers::SYS_RT_SIGRETURN {
+            return self.do_rt_sigreturn();
+        }
+
         let mut fs_base = self.cpu.fs_base;
         let mut gs_base = self.cpu.gs_base;
 
@@ -378,12 +578,234 @@ impl CanaryRuntime {
             Err(canary_syscall::SyscallError::Exit(code)) => {
                 Err(CanaryError::Exit(code))
             }
+            Err(canary_syscall::SyscallError::ExecveRequest { path, argv, envp }) => {
+                self.do_execve(&path, &argv, &envp)
+            }
+            Err(canary_syscall::SyscallError::CloneRequest {
+                new_tid, child_stack: _, parent_tidptr: _, child_tidptr: _,
+                tls: _, flags: _,
+            }) => {
+                // The CloneInfo was already pushed into ctx.pending_clone by the
+                // syscall handler.  In the parent we return the new TID in RAX
+                // (same as real Linux).  The JS harness calls drain_clone_requests()
+                // after each step and spawns a Worker for each entry.
+                self.cpu.fs_base = fs_base;
+                self.cpu.gs_base = gs_base;
+                self.cpu.gpr[reg::RAX] = new_tid as u64;
+                Ok(())
+            }
+            Err(canary_syscall::SyscallError::Fault(addr)) => {
+                warn(&format!("syscall {nr}: fault at {addr:#x}"));
+                self.cpu.gpr[reg::RAX] = (-14i64) as u64; // EFAULT
+                Ok(())
+            }
             Err(e) => {
                 warn(&format!("syscall {nr} error: {e}"));
                 self.cpu.gpr[reg::RAX] = (-38i64) as u64; // ENOSYS
                 Ok(())
             }
         }
+    }
+
+    /// Handle execve by loading the new binary from the VFS and restarting
+    /// the interpreter loop within the same CanaryRuntime.
+    fn do_execve(&mut self, path: &str, argv: &[String], envp: &[String]) -> Result<(), CanaryError> {
+        // Resolve absolute path.
+        let abs_path = if path.starts_with('/') {
+            path.to_string()
+        } else {
+            let cwd = self.ctx.cwd.clone();
+            if cwd.ends_with('/') {
+                format!("{}{}", cwd, path)
+            } else {
+                format!("{}/{}", cwd, path)
+            }
+        };
+
+        // Look up the binary in the VFS.
+        let ino = self.ctx.vfs.mem.lookup(&abs_path)
+            .map_err(|_| CanaryError::Exec(format!("execve: not found: {abs_path}")))?;
+        let binary = {
+            let node = self.ctx.vfs.mem.node(ino);
+            if node.content.is_empty() {
+                return Err(CanaryError::Exec(format!("execve: empty binary: {abs_path}")));
+            }
+            node.content.clone()
+        };
+
+        log(&format!("Canary: execve '{}' ({} bytes, {} args)", abs_path, binary.len(), argv.len()));
+
+        // run_elf_inner resets cpu, mem, and fds — then runs the new binary
+        // until it exits.  Its exit code becomes our Exit error.
+        match self.run_elf_inner(&binary, argv, envp) {
+            Ok(code)                     => Err(CanaryError::Exit(code)),
+            Err(CanaryError::Exit(code)) => Err(CanaryError::Exit(code)),
+            Err(e)                       => Err(e),
+        }
+    }
+
+    /// Push a signal frame onto the guest stack and redirect execution to
+    /// the signal handler.
+    ///
+    /// Signal frame layout on x86-64 Linux (simplified ucontext_t):
+    ///   RSP →  [return address = restorer]           +0   (8 bytes)
+    ///          [siginfo_t  — 128 bytes, zeroed]       +8
+    ///          [uc_flags   (u64)]                     +136
+    ///          [uc_link    (u64)]                     +144
+    ///          [stack_t    (24 bytes)]                +152
+    ///          [mcontext gregs — 23 × u64 = 184 bytes]+176
+    ///
+    /// Total = 176 + 184 = 360 bytes, rounded up to 16-byte alignment.
+    fn push_signal_frame(
+        &mut self,
+        signum:     u32,
+        handler_va: u64,
+        restorer:   u64,
+    ) -> Result<(), CanaryError> {
+        use canary_cpu::registers::reg;
+
+        // Snapshot all GPRs + RIP + RFLAGS before we touch anything.
+        let saved_r8    = self.cpu.gpr[reg::R8];
+        let saved_r9    = self.cpu.gpr[reg::R9];
+        let saved_r10   = self.cpu.gpr[reg::R10];
+        let saved_r11   = self.cpu.gpr[reg::R11];
+        let saved_r12   = self.cpu.gpr[reg::R12];
+        let saved_r13   = self.cpu.gpr[reg::R13];
+        let saved_r14   = self.cpu.gpr[reg::R14];
+        let saved_r15   = self.cpu.gpr[reg::R15];
+        let saved_rdi   = self.cpu.gpr[reg::RDI];
+        let saved_rsi   = self.cpu.gpr[reg::RSI];
+        let saved_rbp   = self.cpu.gpr[reg::RBP];
+        let saved_rbx   = self.cpu.gpr[reg::RBX];
+        let saved_rdx   = self.cpu.gpr[reg::RDX];
+        let saved_rax   = self.cpu.gpr[reg::RAX];
+        let saved_rcx   = self.cpu.gpr[reg::RCX];
+        let saved_rsp   = self.cpu.gpr[reg::RSP];
+        let saved_rip   = self.cpu.rip;
+        let saved_rflags= self.cpu.rflags;
+
+        // Frame size: 8 (retaddr) + 128 (siginfo) + 8 (uc_flags) + 8 (uc_link)
+        //             + 24 (stack_t) + 23*8 (gregs) = 360 bytes.
+        const FRAME_SIZE: u64 = 360;
+
+        // Align RSP down to 16, then subtract the frame.
+        let new_rsp = (saved_rsp & !0xF_u64).wrapping_sub(FRAME_SIZE);
+
+        // Write frame — everything starts zeroed in mapped memory.
+        // +0: return address (restorer)
+        self.mem.write_u64(new_rsp, restorer)
+            .map_err(|e| CanaryError::Exec(format!("signal frame write: {e}")))?;
+
+        // +8..+136: siginfo_t (128 bytes) — leave zeroed; just write signo.
+        self.mem.write_u32(new_rsp + 8, signum)
+            .map_err(|e| CanaryError::Exec(format!("signal frame write: {e}")))?;
+
+        // +136: uc_flags
+        self.mem.write_u64(new_rsp + 136, 0)
+            .map_err(|e| CanaryError::Exec(format!("signal frame write: {e}")))?;
+        // +144: uc_link
+        self.mem.write_u64(new_rsp + 144, 0)
+            .map_err(|e| CanaryError::Exec(format!("signal frame write: {e}")))?;
+        // +152: stack_t (24 bytes) — leave zeroed (no altstack active).
+
+        // +176: mcontext gregs[0..23]
+        //   [0]=R8, [1]=R9, [2]=R10, [3]=R11,
+        //   [4]=R12, [5]=R13, [6]=R14, [7]=R15,
+        //   [8]=RDI, [9]=RSI, [10]=RBP, [11]=RBX,
+        //   [12]=RDX, [13]=RAX, [14]=RCX, [15]=RSP,
+        //   [16]=RIP, [17]=EFL, [18..22]=misc zeros
+        let gregs_base = new_rsp + 176;
+        let gregs: [u64; 23] = [
+            saved_r8, saved_r9, saved_r10, saved_r11,
+            saved_r12, saved_r13, saved_r14, saved_r15,
+            saved_rdi, saved_rsi, saved_rbp, saved_rbx,
+            saved_rdx, saved_rax, saved_rcx, saved_rsp,
+            saved_rip, saved_rflags, 0, 0, 0, 0, 0,
+        ];
+        for (i, &v) in gregs.iter().enumerate() {
+            self.mem.write_u64(gregs_base + i as u64 * 8, v)
+                .map_err(|e| CanaryError::Exec(format!("signal frame write: {e}")))?;
+        }
+
+        // Redirect execution.
+        self.cpu.gpr[reg::RSP] = new_rsp;
+        self.cpu.gpr[reg::RDI] = signum as u64; // first arg: signal number
+        self.cpu.rip = handler_va;
+
+        Ok(())
+    }
+
+    /// Restore registers from the ucontext on the stack (rt_sigreturn).
+    fn do_rt_sigreturn(&mut self) -> Result<(), CanaryError> {
+        use canary_cpu::registers::reg;
+
+        let frame_base = self.cpu.gpr[reg::RSP];
+
+        // gregs are at frame_base + 176.
+        let gregs_base = frame_base + 176;
+        let mut gregs = [0u64; 23];
+        for (i, v) in gregs.iter_mut().enumerate() {
+            *v = self.mem.read_u64(gregs_base + i as u64 * 8)
+                .map_err(|e| CanaryError::Exec(format!("sigreturn read: {e}")))?;
+        }
+
+        // Restore GPRs.
+        self.cpu.gpr[reg::R8]  = gregs[0];
+        self.cpu.gpr[reg::R9]  = gregs[1];
+        self.cpu.gpr[reg::R10] = gregs[2];
+        self.cpu.gpr[reg::R11] = gregs[3];
+        self.cpu.gpr[reg::R12] = gregs[4];
+        self.cpu.gpr[reg::R13] = gregs[5];
+        self.cpu.gpr[reg::R14] = gregs[6];
+        self.cpu.gpr[reg::R15] = gregs[7];
+        self.cpu.gpr[reg::RDI] = gregs[8];
+        self.cpu.gpr[reg::RSI] = gregs[9];
+        self.cpu.gpr[reg::RBP] = gregs[10];
+        self.cpu.gpr[reg::RBX] = gregs[11];
+        self.cpu.gpr[reg::RDX] = gregs[12];
+        self.cpu.gpr[reg::RAX] = gregs[13];
+        self.cpu.gpr[reg::RCX] = gregs[14];
+        self.cpu.gpr[reg::RSP] = gregs[15];
+        self.cpu.rip            = gregs[16];
+        self.cpu.rflags         = gregs[17];
+
+        Ok(())
+    }
+
+    /// Deliver any pending, unblocked signals before the next instruction.
+    fn deliver_pending_signals(&mut self) -> Result<(), CanaryError> {
+        let deliverable = self.ctx.signals.pending & !self.ctx.signals.mask;
+        if deliverable == 0 { return Ok(()); }
+
+        // Find the lowest-numbered pending signal.
+        let bit    = deliverable.trailing_zeros();  // 0-based bit index
+        let signum = bit + 1;                       // 1-based signal number
+
+        // Clear the pending bit.
+        self.ctx.signals.pending &= !(1u64 << bit);
+
+        let handler = self.ctx.signals.handlers[bit as usize];
+
+        match handler.handler_va {
+            0 => {
+                // SIG_DFL — default action.
+                match signum {
+                    // SIGCHLD=17, SIGCONT=18, SIGSTOP=19, SIGTSTP=20,
+                    // SIGURG=23, SIGWINCH=28: default is ignore.
+                    17 | 18 | 19 | 20 | 23 | 28 => {}
+                    _ => return Err(CanaryError::Exit(-(signum as i32))),
+                }
+            }
+            1 => {
+                // SIG_IGN — explicitly ignored.
+            }
+            va => {
+                // User-space handler: build a signal frame and redirect RIP.
+                self.push_signal_frame(signum, va, handler.restorer)?;
+            }
+        }
+
+        Ok(())
     }
 
     fn step_inner(&mut self) -> bool {
@@ -401,3 +823,37 @@ impl CanaryRuntime {
 // ── panic hook ────────────────────────────────────────────────────────────────
 
 fn console_error_panic_hook_init() {}
+
+// ── Base64 helper (no external dependency) ────────────────────────────────────
+
+fn base64_encode(data: &[u8]) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::with_capacity((data.len() + 2) / 3 * 4);
+    let mut chunks = data.chunks_exact(3);
+    for chunk in chunks.by_ref() {
+        let n = (chunk[0] as u32) << 16 | (chunk[1] as u32) << 8 | chunk[2] as u32;
+        out.push(CHARS[((n >> 18) & 0x3F) as usize]);
+        out.push(CHARS[((n >> 12) & 0x3F) as usize]);
+        out.push(CHARS[((n >>  6) & 0x3F) as usize]);
+        out.push(CHARS[( n        & 0x3F) as usize]);
+    }
+    let rem = chunks.remainder();
+    match rem.len() {
+        1 => {
+            let n = (rem[0] as u32) << 16;
+            out.push(CHARS[((n >> 18) & 0x3F) as usize]);
+            out.push(CHARS[((n >> 12) & 0x3F) as usize]);
+            out.push(b'=');
+            out.push(b'=');
+        }
+        2 => {
+            let n = (rem[0] as u32) << 16 | (rem[1] as u32) << 8;
+            out.push(CHARS[((n >> 18) & 0x3F) as usize]);
+            out.push(CHARS[((n >> 12) & 0x3F) as usize]);
+            out.push(CHARS[((n >>  6) & 0x3F) as usize]);
+            out.push(b'=');
+        }
+        _ => {}
+    }
+    String::from_utf8(out).unwrap_or_default()
+}

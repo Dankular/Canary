@@ -35,10 +35,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "canary-fb"
+version = "0.1.0"
+dependencies = [
+ "canary-memory",
+ "thiserror",
+]
+
+[[package]]
 name = "canary-fs"
 version = "0.1.0"
 dependencies = [
  "bitflags",
+ "log",
+ "thiserror",
+]
+
+[[package]]
+name = "canary-jit"
+version = "0.1.0"
+dependencies = [
+ "canary-cpu",
+ "canary-memory",
  "log",
  "thiserror",
 ]
@@ -53,12 +71,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "canary-net"
+version = "0.1.0"
+dependencies = [
+ "canary-memory",
+ "thiserror",
+]
+
+[[package]]
 name = "canary-syscall"
 version = "0.1.0"
 dependencies = [
+ "canary-fb",
  "canary-fs",
  "canary-memory",
+ "canary-net",
+ "canary-thread",
  "log",
+ "thiserror",
+]
+
+[[package]]
+name = "canary-thread"
+version = "0.1.0"
+dependencies = [
+ "canary-cpu",
  "thiserror",
 ]
 
@@ -68,9 +105,13 @@ version = "0.1.0"
 dependencies = [
  "canary-cpu",
  "canary-elf",
+ "canary-fb",
  "canary-fs",
+ "canary-jit",
  "canary-memory",
+ "canary-net",
  "canary-syscall",
+ "canary-thread",
  "js-sys",
  "log",
  "serde",

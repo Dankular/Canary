@@ -6,6 +6,10 @@ members = [
     "crates/canary-memory",
     "crates/canary-syscall",
     "crates/canary-fs",
+    "crates/canary-fb",
+    "crates/canary-thread",
+    "crates/canary-jit",
+    "crates/canary-net",
     "crates/canary-wasm",
 ]
 
@@ -14,6 +18,12 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Canary Contributors"]
 license = "MIT OR Apache-2.0"
+
+[profile.release]
+opt-level     = 3
+lto           = true
+codegen-units = 1
+panic         = "abort"
 
 [workspace.dependencies]
 canary-memory = { path = "crates/canary-memory" }

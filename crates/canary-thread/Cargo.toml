@@ -1,0 +1,8 @@
+[package]
+name = "canary-thread"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+canary-cpu  = { path = "../canary-cpu" }
+thiserror   = { workspace = true }

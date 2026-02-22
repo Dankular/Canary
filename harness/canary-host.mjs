@@ -17,6 +17,8 @@
 const term   = document.getElementById('terminal');
 const dot    = document.getElementById('status-dot');
 const status = document.getElementById('status-text');
+const canvas = document.getElementById('fb');
+const ctx2d  = canvas ? canvas.getContext('2d') : null;
 
 function setStatus(text, kind = 'loading') {
   status.textContent = text;
@@ -45,6 +47,76 @@ const ENV       = [
   'LANG=en_US.UTF-8',
 ];
 
+// ── WebSocket / TCP bridge ────────────────────────────────────────────────────
+//
+// The WASM module cannot open TCP connections directly.  We bridge via
+// WebSocket: each connect() queues a {fd, ip, port} entry; JS opens a WS and
+// calls socket_connected() / socket_recv_data() as events arrive.
+//
+// For real TCP you need a TCP-over-WS proxy (e.g. websockify) on the target
+// host.  For servers that already speak WebSocket the connection works directly.
+//
+// wsMap  — fd (number) → WebSocket instance
+// rtRef  — set once we have the runtime; used by pollNetwork closure
+
+let _wsMap = new Map();   // fd → WebSocket
+let _rtRef = null;
+
+function startNetworkBridge(rt) {
+  _rtRef = rt;
+  _wsMap = new Map();
+  scheduleNetworkPoll();
+}
+
+function scheduleNetworkPoll() {
+  requestAnimationFrame(runNetworkPoll);
+}
+
+function runNetworkPoll() {
+  if (!_rtRef) return;
+
+  // 1. Drain any pending connect() requests and open WebSockets.
+  let connectJson;
+  try { connectJson = _rtRef.drain_connect_requests(); } catch (_) { connectJson = '[]'; }
+  const connects = JSON.parse(connectJson || '[]');
+  for (const req of connects) {
+    if (_wsMap.has(req.fd)) continue;   // already connecting
+    try {
+      const url = `ws://${req.ip}:${req.port}`;
+      const ws = new WebSocket(url);
+      ws.binaryType = 'arraybuffer';
+      ws.onopen = () => {
+        _rtRef.socket_connected(BigInt(req.fd));
+      };
+      ws.onmessage = (e) => {
+        _rtRef.socket_recv_data(BigInt(req.fd), new Uint8Array(e.data));
+      };
+      ws.onerror = () => { /* connection refused / failed — leave as Connecting */ };
+      ws.onclose = () => { _wsMap.delete(req.fd); };
+      _wsMap.set(req.fd, ws);
+    } catch (_) { /* WebSocket constructor may throw on bad URLs */ }
+  }
+
+  // 2. Drain pending outbound data and forward over WebSocket.
+  let sendJson;
+  try { sendJson = _rtRef.drain_socket_sends(); } catch (_) { sendJson = '[]'; }
+  const sends = JSON.parse(sendJson || '[]');
+  for (const req of sends) {
+    const ws = _wsMap.get(req.fd);
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      // Decode base64 data and send as binary.
+      try {
+        const bin = atob(req.data);
+        const buf = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+        ws.send(buf);
+      } catch (_) {}
+    }
+  }
+
+  scheduleNetworkPoll();
+}
+
 // ── Main entry point ──────────────────────────────────────────────────────────
 
 export async function canaryMain() {
@@ -58,6 +130,60 @@ export async function canaryMain() {
 
     const { CanaryRuntime } = wasmMod;
     const rt = new CanaryRuntime();
+
+    // ── Start the WebSocket network bridge ────────────────────────────────
+    // This RAF loop polls for connect/send events from the WASM module and
+    // forwards them via WebSocket.  It starts immediately; it won't do
+    // anything until the guest calls socket()/connect().
+    startNetworkBridge(rt);
+
+    // ── Framebuffer rendering loop ─────────────────────────────────────────
+    // Reads BGRA pixels from the guest's /dev/fb0 mapping and blits them
+    // to the <canvas> element every animation frame.
+    let fbImageData = ctx2d ? ctx2d.createImageData(1024, 768) : null;
+    let fbAnimFrame = null;
+
+    function renderFramebuffer() {
+      if (rt.has_framebuffer()) {
+        if (canvas) canvas.style.display = 'block';
+        const pixels = rt.get_framebuffer();
+        if (pixels.length === 1024 * 768 * 4 && fbImageData) {
+          // Convert BGRA (guest) → RGBA (ImageData)
+          const rgba = fbImageData.data;
+          for (let i = 0; i < pixels.length; i += 4) {
+            rgba[i]     = pixels[i + 2]; // R ← B channel
+            rgba[i + 1] = pixels[i + 1]; // G ← G channel
+            rgba[i + 2] = pixels[i];     // B ← R channel
+            rgba[i + 3] = 255;           // A = opaque
+          }
+          ctx2d.putImageData(fbImageData, 0, 0);
+        }
+      }
+      fbAnimFrame = requestAnimationFrame(renderFramebuffer);
+    }
+    fbAnimFrame = requestAnimationFrame(renderFramebuffer);
+
+    // ── Input event forwarding ────────────────────────────────────────────
+    // Keyboard and mouse events on the canvas are forwarded to the runtime
+    // (stub — extend when /dev/input emulation is added).
+    if (canvas) {
+      canvas.addEventListener('keydown', e => {
+        // TODO: map KeyboardEvent.code → Linux key code and push to input queue.
+        e.preventDefault();
+      });
+      canvas.addEventListener('mousemove', e => {
+        const rect = canvas.getBoundingClientRect();
+        const x = Math.round((e.clientX - rect.left) * (1024 / rect.width));
+        const y = Math.round((e.clientY - rect.top)  * (768  / rect.height));
+        if (rt.push_mouse_event) rt.push_mouse_event(x, y, 0);
+      });
+      canvas.addEventListener('mousedown', e => {
+        if (rt.push_mouse_event) rt.push_mouse_event(0, 0, e.buttons);
+      });
+      canvas.addEventListener('mouseup', e => {
+        if (rt.push_mouse_event) rt.push_mouse_event(0, 0, 0);
+      });
+    }
 
     print('[canary] WASM module ready.', 'log-ok');
 
@@ -134,6 +260,9 @@ export async function canaryMain() {
       const text = new TextDecoder().decode(stderr);
       print('[stderr]\n' + text, 'log-stderr');
     }
+
+    // Stop the framebuffer render loop once the process has exited.
+    if (fbAnimFrame !== null) cancelAnimationFrame(fbAnimFrame);
 
     print(`[canary] Process exited: ${exitCode}  (${elapsed} ms)`,
           exitCode === 0 ? 'log-ok' : 'log-err');

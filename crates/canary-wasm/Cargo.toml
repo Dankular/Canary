@@ -22,9 +22,8 @@ canary-cpu      = { path = "../canary-cpu" }
 canary-memory   = { path = "../canary-memory" }
 canary-syscall  = { path = "../canary-syscall" }
 canary-fs       = { path = "../canary-fs" }
+canary-fb       = { path = "../canary-fb" }
+canary-thread   = { path = "../canary-thread" }
+canary-jit      = { path = "../canary-jit" }
+canary-net      = { path = "../canary-net" }
 
-[profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
-panic = "abort"

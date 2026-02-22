@@ -1,0 +1,10 @@
+[package]
+name = "canary-jit"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+canary-cpu    = { path = "../canary-cpu" }
+canary-memory = { path = "../canary-memory" }
+thiserror     = { workspace = true }
+log           = { workspace = true }
