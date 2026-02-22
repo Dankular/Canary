@@ -130,6 +130,24 @@ impl CanaryRuntime {
         }
     }
 
+    /// Prepare an ELF binary for incremental execution via step().
+    ///
+    /// Unlike run_elf(), this does NOT enter the interpreter loop.
+    /// It parses the ELF, resets CPU/memory, loads segments, sets up the
+    /// stack and auxv, and positions RIP at the entry point — then returns.
+    /// Call step() in a requestAnimationFrame loop to drive execution.
+    ///
+    /// Returns true on success, false if setup fails (check console for error).
+    #[wasm_bindgen]
+    pub fn prepare_elf(&mut self, elf_bytes: &[u8], argv_json: &str, envp_json: &str) -> bool {
+        let argv: Vec<String> = serde_json::from_str(argv_json).unwrap_or_default();
+        let envp: Vec<String> = serde_json::from_str(envp_json).unwrap_or_default();
+        match self.prepare_elf_inner(elf_bytes, &argv, &envp) {
+            Ok(())  => true,
+            Err(e)  => { error(&format!("Canary: prepare_elf error: {e}")); false }
+        }
+    }
+
     /// Execute a single instruction step.  Returns false when the program ends.
     #[wasm_bindgen]
     pub fn step(&mut self) -> bool {
@@ -208,6 +226,29 @@ impl CanaryRuntime {
 
     // ── Threading API ─────────────────────────────────────────────────────
 
+    /// Initialize a thread Worker's register state.
+    /// Called from a Web Worker after init, before run.
+    /// Sets RSP to child_stack, FS base to tls, writes tid to child_tidptr.
+    #[wasm_bindgen]
+    pub fn init_thread(&mut self, child_stack: u64, tls: u64, child_tidptr: u64) {
+        use canary_cpu::registers::reg;
+        // Child thread starts with RAX=0 (clone returns 0 in child)
+        self.cpu.gpr[reg::RAX] = 0;
+        // RSP = child_stack (passed in clone() call)
+        if child_stack != 0 {
+            self.cpu.gpr[reg::RSP] = child_stack;
+        }
+        // TLS base (arch_prctl ARCH_SET_FS equivalent)
+        if tls != 0 {
+            self.cpu.fs_base = tls;
+        }
+        // Write TID to child_tidptr (CLONE_CHILD_SETTID)
+        if child_tidptr != 0 {
+            let tid = self.ctx.current_tid;
+            self.mem.write_u32(child_tidptr, tid).ok();
+        }
+    }
+
     /// Drain any pending `clone` requests and return them as a JSON array.
     ///
     /// Each element has the shape:
@@ -245,6 +286,44 @@ impl CanaryRuntime {
     #[wasm_bindgen]
     pub fn set_current_tid(&mut self, tid: u32) {
         self.ctx.current_tid = tid;
+    }
+
+    // ── JIT Tier-1 API ────────────────────────────────────────────────────
+
+    /// Emit WASM bytecode for the basic block at `entry_rip`.
+    ///
+    /// Returns the raw WASM module binary, or an empty Vec if the block could
+    /// not be compiled or contains instructions not yet supported by the
+    /// Tier-1 emitter.
+    ///
+    /// JS calls `WebAssembly.compile()` on the returned bytes and then calls
+    /// `mark_jit_compiled(entry_rip)` to record that Tier-1 is ready.
+    #[wasm_bindgen]
+    pub fn emit_jit_block(&mut self, entry_rip: u64) -> Vec<u8> {
+        if self.jit.get_mut(entry_rip).is_none() {
+            self.jit.compile(entry_rip, &self.mem);
+        }
+        if let Some(block) = self.jit.get_mut(entry_rip) {
+            canary_jit::emitter::emit_block(block).unwrap_or_default()
+        } else {
+            vec![]
+        }
+    }
+
+    /// Mark the basic block at `entry_rip` as having a Tier-1 compiled WASM
+    /// module ready for execution.
+    ///
+    /// JS calls this after `WebAssembly.compile()` succeeds on the bytes
+    /// returned by `emit_jit_block()`.  Returns `true` if the block was found
+    /// in the JIT cache and promoted, `false` otherwise.
+    #[wasm_bindgen]
+    pub fn mark_jit_compiled(&mut self, entry_rip: u64) -> bool {
+        if let Some(block) = self.jit.get_mut(entry_rip) {
+            block.tier = canary_jit::JitTier::Compiled;
+            true
+        } else {
+            false
+        }
     }
 
     // ── Networking API ────────────────────────────────────────────────────
@@ -315,6 +394,57 @@ impl CanaryRuntime {
             }
         }
     }
+
+    // ── I/O port API ──────────────────────────────────────────────────────
+
+    /// Drain all I/O port writes from the guest as JSON.
+    /// Format: [{"port":0x7860,"size":4,"val":305419896}, ...]
+    #[wasm_bindgen]
+    pub fn drain_io_writes(&mut self) -> String {
+        let writes = self.ctx.io.drain_writes();
+        if writes.is_empty() { return "[]".into(); }
+        let entries: Vec<String> = writes.iter().map(|w| {
+            format!(r#"{{"port":{},"size":{},"val":{}}}"#, w.port, w.size, w.val)
+        }).collect();
+        format!("[{}]", entries.join(","))
+    }
+
+    /// Push an I/O port read response (JS to guest).
+    /// Call this before the guest's next IN instruction.
+    #[wasm_bindgen]
+    pub fn push_io_read(&mut self, port: u16, size: u8, val: u32) {
+        self.ctx.io.push_read_response(port, size, val);
+    }
+
+    // ── Input device API ──────────────────────────────────────────────────
+
+    /// Push a keyboard event from JS.
+    /// `code` is the browser KeyboardEvent.code string (e.g., "KeyA", "Space").
+    /// `pressed` is true for keydown, false for keyup.
+    #[wasm_bindgen]
+    pub fn push_key_event(&mut self, code: &str, pressed: bool) {
+        use canary_input::keycodes::browser_code_to_linux;
+        if let Some(keycode) = browser_code_to_linux(code) {
+            self.ctx.input.key_event(keycode, pressed);
+        }
+    }
+
+    /// Push a mouse button event.
+    /// `button`: 0=left, 1=middle, 2=right (browser convention).
+    /// `pressed`: true=down, false=up.
+    #[wasm_bindgen]
+    pub fn push_mouse_button(&mut self, button: u8, pressed: bool) {
+        use canary_input::{BTN_LEFT, BTN_RIGHT, BTN_MIDDLE};
+        let code = match button { 0 => BTN_LEFT, 1 => BTN_MIDDLE, _ => BTN_RIGHT };
+        self.ctx.input.mouse_button(code, pressed);
+    }
+
+    /// Push a mouse motion event.
+    /// `x`, `y` are canvas-relative pixel coordinates (will be converted to relative deltas).
+    #[wasm_bindgen]
+    pub fn push_mouse_move(&mut self, x: i32, y: i32) {
+        self.ctx.input.mouse_move(x, y);
+    }
 }
 
 // ── Error type ────────────────────────────────────────────────────────────────
@@ -342,7 +472,9 @@ impl std::fmt::Display for CanaryError {
 // ── Internal implementation ───────────────────────────────────────────────────
 
 impl CanaryRuntime {
-    fn run_elf_inner(&mut self, data: &[u8], argv: &[String], envp: &[String]) -> Result<i32, CanaryError> {
+    /// Set up memory, CPU, and stack for an ELF binary without executing it.
+    /// Shared setup between prepare_elf() and run_elf().
+    fn prepare_elf_inner(&mut self, data: &[u8], argv: &[String], envp: &[String]) -> Result<(), CanaryError> {
         // ── 1. Parse main ELF ─────────────────────────────────────────────
         let elf = Elf64::parse(data, layout::ELF_BASE)?;
         log(&format!(
@@ -354,13 +486,11 @@ impl CanaryRuntime {
         self.mem  = GuestMemory::new(layout::TOTAL_WASM_BYTES);
         self.cpu  = CpuState::default();
         self.jit  = JitCache::new();
-        // Keep ctx.vfs (filesystem) but reset fds and signal state.
         self.ctx.fds     = canary_syscall::dispatch::FdTable::new();
         self.ctx.cwd     = "/".to_string();
         self.ctx.stdout_buf.clear();
         self.ctx.stderr_buf.clear();
         self.ctx.signals = canary_syscall::dispatch::SignalState::default();
-        // Reset threading state: main thread is always TID 1.
         self.ctx.threads       = canary_thread::ThreadTable::new(1);
         self.ctx.current_tid   = 1;
         self.ctx.pending_clone = Vec::new();
@@ -385,7 +515,6 @@ impl CanaryRuntime {
             (0, elf.entry)
         };
 
-        // The CPU will start at the interpreter's entry (or the ELF entry for static).
         let start_rip = if interp_base != 0 { interp_entry } else { elf.entry };
 
         // ── 5. Map stack ──────────────────────────────────────────────────
@@ -402,20 +531,27 @@ impl CanaryRuntime {
 
         let auxv = build_auxv(
             phdr_addr,
-            56,                             // sizeof Elf64Phdr
+            56,
             elf.header.e_phnum as u64,
-            interp_base,                    // AT_BASE = interp load addr (0 = static)
-            elf.entry,                      // AT_ENTRY = main ELF entry
-            0, 0,                           // patched by build_initial_stack
+            interp_base,
+            elf.entry,
+            0, 0,
         );
         let stack = build_initial_stack(layout::STACK_TOP, &argv_refs, &envp_refs, &auxv, [0u8; 16]);
         self.mem.loader_write(stack.rsp, &stack.data);
 
-        // ── 7. Set up CPU state ───────────────────────────────────────────
+        // ── 7. Position CPU at entry point (ready for step()) ─────────────
         self.cpu.rip = start_rip;
         self.cpu.gpr[canary_cpu::registers::reg::RSP] = stack.rsp;
 
-        // ── 8. Run interpreter loop ───────────────────────────────────────
+        log(&format!("Canary: ELF prepared, entry={:#x} — call step() to execute", self.cpu.rip));
+        Ok(())
+    }
+
+    fn run_elf_inner(&mut self, data: &[u8], argv: &[String], envp: &[String]) -> Result<i32, CanaryError> {
+        // Set up ELF (parse, load, stack, CPU) then immediately run to completion.
+        self.prepare_elf_inner(data, argv, envp)?;
+
         log(&format!("Canary: executing from {:#x}", self.cpu.rip));
         loop {
             match self.step_once() {
@@ -543,6 +679,23 @@ impl CanaryRuntime {
                 Err(CanaryError::Exec(format!("illegal instruction @{rip:#x}")))
             }
             Err(ExecError::Int(n)) => Err(CanaryError::Exec(format!("INT {n} @{rip:#x}"))),
+            Err(ExecError::IoPort { dir: 1, port, size, val }) => {
+                // OUT instruction — guest is writing to I/O port
+                self.ctx.io.guest_out(port, size, val);
+                Ok(())
+            }
+            Err(ExecError::IoPort { dir: 0, port, size, .. }) => {
+                // IN instruction — guest wants to read from I/O port
+                let val = self.ctx.io.guest_in(port, size);
+                use canary_cpu::registers::reg;
+                match size {
+                    1  => self.cpu.gpr[reg::RAX] = (self.cpu.gpr[reg::RAX] & !0xFF) | (val as u64),
+                    2  => self.cpu.gpr[reg::RAX] = (self.cpu.gpr[reg::RAX] & !0xFFFF) | (val as u64),
+                    _  => self.cpu.gpr[reg::RAX] = val as u64,
+                }
+                Ok(())
+            }
+            Err(ExecError::IoPort { .. }) => Ok(()), // unexpected dir value — ignore
             Err(e) => Err(CanaryError::Exec(e.to_string())),
         }
     }
