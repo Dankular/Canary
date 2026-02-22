@@ -148,6 +148,8 @@ pub struct SyscallCtx {
     // ── Input devices ─────────────────────────────────────────────────────
     /// Linux evdev input emulation for /dev/input/event0.
     pub input: canary_input::InputCtx,
+    /// Path of the main executable (returned by readlink("/proc/self/exe")).
+    pub proc_exe: String,
 }
 
 impl SyscallCtx {
@@ -184,6 +186,7 @@ impl SyscallCtx {
             net:           canary_net::NetCtx::new(),
             io:            canary_io::IoCtx::new(),
             input:         canary_input::InputCtx::new(),
+            proc_exe:      String::new(),
         }
     }
 }
@@ -589,6 +592,13 @@ pub fn handle_syscall(
             let buf_sz   = if nr == SYS_READLINK { a2 } else { a3 } as usize;
             let path = mem.read_cstr(path_ptr)?;
             let abs  = resolve_path(&ctx.cwd, &path);
+            // Special: /proc/self/exe → main binary path.
+            if abs == "/proc/self/exe" || abs == "/proc/1/exe" {
+                let exe = ctx.proc_exe.as_bytes();
+                let n = exe.len().min(buf_sz);
+                if n > 0 { mem.write_bytes_at(buf_ptr, &exe[..n])?; }
+                return Ok(n as i64);
+            }
             match ctx.vfs.mem.lookup(&abs) {
                 Ok(ino) => {
                     if let Some(target) = &ctx.vfs.mem.node(ino).link_target {
@@ -709,36 +719,46 @@ pub fn handle_syscall(
             let op    = (a1 & 0x7f) as u32;
             let val   = a2 as i32;
 
-            const FUTEX_WAIT_OP:  u32 = 0;
-            const FUTEX_WAKE_OP:  u32 = 1;
-            const FUTEX_WAIT_POP: u32 = 128;    // FUTEX_WAIT | FUTEX_PRIVATE_FLAG
-            const FUTEX_WAKE_POP: u32 = 129;    // FUTEX_WAKE | FUTEX_PRIVATE_FLAG
+            // Note: `op` already has FUTEX_PRIVATE_FLAG (0x80) and
+            // FUTEX_CLOCK_REALTIME (0x100) stripped by the `& 0x7f` mask above,
+            // so we only match against the base opcode values.
+            const FUTEX_WAIT:        u32 = 0;
+            const FUTEX_WAKE:        u32 = 1;
+            const FUTEX_REQUEUE:     u32 = 3;
+            const FUTEX_CMP_REQUEUE: u32 = 4;
+            const FUTEX_WAIT_BITSET: u32 = 9;
+            const FUTEX_WAKE_BITSET: u32 = 10;
 
             match op {
-                FUTEX_WAIT_OP | FUTEX_WAIT_POP => {
-                    // Read the 32-bit futex word at uaddr.
+                // ── WAIT / WAIT_BITSET ────────────────────────────────────
+                // In cooperative single-threaded mode we cannot truly block.
+                // Return EAGAIN so glibc's spin loop backs off and retries on
+                // the next scheduler slice; the JS step loop interleaves.
+                FUTEX_WAIT | FUTEX_WAIT_BITSET => {
                     let current = mem.read_i32(uaddr)
                         .map_err(|_| SyscallError::Fault(uaddr))?;
-                    if current != val {
-                        // Value already changed — caller must retry.
-                        return Ok(-EAGAIN);
-                    }
-                    // In single-threaded (or cooperative) mode the main WASM
-                    // thread cannot truly block.  Return EAGAIN so that glibc's
-                    // pthread_mutex_lock spin loop backs off and retries; the JS
-                    // scheduler can interleave other threads between steps.
-                    // Worker threads will use Atomics.wait() on the JS side
-                    // directly and never reach this path.
+                    if current != val { return Ok(-EAGAIN); }
                     -EAGAIN
                 }
-                FUTEX_WAKE_OP | FUTEX_WAKE_POP => {
-                    // val = maximum number of waiters to wake.
-                    // We don't track waiters in Rust — return 0 (no waiters
-                    // found here; Atomics.notify() on the JS side handles the
-                    // real wakeup for Worker threads).
-                    let _wake_count = a2; // how many to wake (ignored in stub)
+
+                // ── WAKE / WAKE_BITSET ────────────────────────────────────
+                // We don't track waiters in Rust; Atomics.notify() on the JS
+                // side handles Worker thread wakeups.
+                FUTEX_WAKE | FUTEX_WAKE_BITSET => 0,
+
+                // ── REQUEUE (condition variable broadcast) ────────────────
+                FUTEX_REQUEUE => 0, // stub: no waiters to requeue
+
+                // ── CMP_REQUEUE (pthread_cond_signal) ─────────────────────
+                FUTEX_CMP_REQUEUE => {
+                    // a5 = val3 (expected value of *uaddr)
+                    let expected = a5 as i32;
+                    let current  = mem.read_i32(uaddr)
+                        .map_err(|_| SyscallError::Fault(uaddr))?;
+                    if current != expected { return Ok(-EAGAIN); }
                     0
                 }
+
                 _ => -EINVAL,
             }
         }
@@ -808,20 +828,33 @@ pub fn handle_syscall(
 
         // ── writev ────────────────────────────────────────────────────────
         SYS_WRITEV => {
-            let fd    = a0;
-            let iov   = a1;
+            let fd     = a0;
+            let iov    = a1;
             let iovcnt = a2 as usize;
             let mut total = 0i64;
             for i in 0..iovcnt {
                 let iov_base = mem.read_u64(iov + i as u64 * 16)?;
                 let iov_len  = mem.read_u64(iov + i as u64 * 16 + 8)? as usize;
-                let data = mem.read_bytes(iov_base, iov_len)?.to_vec();
+                if iov_len == 0 { continue; }
+                let data = mem.read_bytes(iov_base, iov_len)
+                    .map(|s| s.to_vec())
+                    .or_else(|_| mem.read_bytes_copy(iov_base, iov_len))
+                    .unwrap_or_default();
                 match fd {
                     1 => ctx.stdout_buf.extend_from_slice(&data),
                     2 => ctx.stderr_buf.extend_from_slice(&data),
-                    _ => {}
+                    _ => {
+                        let ino = match ctx.fds.get(fd) { Some(f) => f.ino, None => return Ok(-EBADF) };
+                        let off = match ctx.fds.get(fd) { Some(f) => f.offset as usize, None => return Ok(-EBADF) };
+                        let node = ctx.vfs.mem.node_mut(ino);
+                        if off + data.len() > node.content.len() {
+                            node.content.resize(off + data.len(), 0);
+                        }
+                        node.content[off..off + data.len()].copy_from_slice(&data);
+                        ctx.fds.get_mut(fd).unwrap().offset += data.len() as u64;
+                    }
                 }
-                total += iov_len as i64;
+                total += data.len() as i64;
             }
             total
         }
@@ -888,6 +921,32 @@ pub fn handle_syscall(
             0
         }
 
+        // ── readv(fd, iov, iovcnt) ────────────────────────────────────────
+        SYS_READV => {
+            let fd     = a0;
+            let iov    = a1;
+            let iovcnt = a2 as usize;
+            if fd == 0 { return Ok(0); } // stdin: EOF
+            let mut total = 0i64;
+            for i in 0..iovcnt {
+                let iov_base = mem.read_u64(iov + i as u64 * 16)?;
+                let iov_len  = mem.read_u64(iov + i as u64 * 16 + 8)? as usize;
+                if iov_len == 0 { continue; }
+                let ino    = match ctx.fds.get(fd)  { Some(f) => f.ino,    None => return Ok(-EBADF) };
+                let offset = match ctx.fds.get(fd)  { Some(f) => f.offset, None => return Ok(-EBADF) };
+                let avail  = ctx.vfs.mem.node(ino).content.len().saturating_sub(offset as usize);
+                let n      = iov_len.min(avail);
+                if n > 0 {
+                    let slice = ctx.vfs.mem.node(ino).content[offset as usize..offset as usize + n].to_vec();
+                    mem.write_bytes_at(iov_base, &slice)?;
+                    ctx.fds.get_mut(fd).unwrap().offset += n as u64;
+                    total += n as i64;
+                }
+                if n < iov_len { break; } // EOF reached
+            }
+            total
+        }
+
         // ── pread64(fd, buf, count, offset) ──────────────────────────────
         SYS_PREAD64 => {
             let fd     = a0;
@@ -905,6 +964,31 @@ pub fn handle_syscall(
                 mem.write_bytes_at(buf, slice)?;
             }
             n as i64
+        }
+
+        // ── pwrite64(fd, buf, count, offset) ─────────────────────────────
+        SYS_PWRITE64 => {
+            let fd     = a0;
+            let buf    = a1;
+            let count  = a2 as usize;
+            let offset = a3 as usize;
+            let data = mem.read_bytes(buf, count)
+                .map(|s| s.to_vec())
+                .or_else(|_| mem.read_bytes_copy(buf, count))?;
+            match fd {
+                1 => { ctx.stdout_buf.extend_from_slice(&data); data.len() as i64 }
+                2 => { ctx.stderr_buf.extend_from_slice(&data); data.len() as i64 }
+                _ => {
+                    let ino = match ctx.fds.get(fd) { Some(f) => f.ino, None => return Ok(-EBADF) };
+                    let node = ctx.vfs.mem.node_mut(ino);
+                    if offset + data.len() > node.content.len() {
+                        node.content.resize(offset + data.len(), 0);
+                    }
+                    node.content[offset..offset + data.len()].copy_from_slice(&data);
+                    node.stat.size = node.content.len() as i64;
+                    data.len() as i64
+                }
+            }
         }
 
         // ── getdents64(fd, buf, count) ───────────────────────────────────
@@ -1217,10 +1301,60 @@ pub fn handle_syscall(
         // ── utimensat / utime (stub) ──────────────────────────────────────
         SYS_UTIMENSAT => 0,
 
-        // ── statx (forward to stat) ───────────────────────────────────────
+        // ── statx(dirfd, path, flags, mask, statxbuf) ────────────────────
         SYS_STATX => {
-            // a1 = path, a4 = buf (statx_buf), simplified: return ENOSYS
-            -ENOSYS
+            // Layout of struct statx (x86-64, kernel 4.11+):
+            //  +0   stx_mask       u32    +4  stx_blksize  u32
+            //  +8   stx_attributes u64
+            //  +16  stx_nlink      u32    +20 stx_uid      u32
+            //  +24  stx_gid        u32    +28 stx_mode     u16  +30 __spare0 u16
+            //  +32  stx_ino        u64    +40 stx_size     u64
+            //  +48  stx_blocks     u64    +56 stx_attributes_mask u64
+            //  +64  stx_atime (statx_timestamp: i64 sec + u32 nsec + i32 pad = 16 B)
+            //  +80  stx_btime      +96  stx_ctime     +112 stx_mtime
+            //  +128 stx_rdev_major u32  +132 stx_rdev_minor u32
+            //  +136 stx_dev_major  u32  +140 stx_dev_minor  u32
+            const AT_EMPTY_PATH: u64 = 0x1000;
+            let statxbuf = a4;
+            let ino_res: Result<usize, _> = if a2 & AT_EMPTY_PATH != 0 && a0 as i64 != AT_FDCWD {
+                // fstat by dirfd
+                match ctx.fds.get(a0) {
+                    Some(f) => Ok(f.ino),
+                    None    => Err(()),
+                }
+            } else {
+                let path = mem.read_cstr(a1)?;
+                let abs  = resolve_path(&ctx.cwd, &path);
+                ctx.vfs.mem.lookup(&abs).map_err(|_| ())
+            };
+            match ino_res {
+                Ok(ino) => {
+                    let s = ctx.vfs.mem.node(ino).stat.clone();
+                    mem.write_u32(statxbuf,       0x07ff)?; // stx_mask: all basic fields
+                    mem.write_u32(statxbuf +   4, 4096)?;   // stx_blksize
+                    mem.write_u64(statxbuf +   8, 0)?;      // stx_attributes
+                    mem.write_u32(statxbuf +  16, s.nlink as u32)?;
+                    mem.write_u32(statxbuf +  20, s.uid)?;
+                    mem.write_u32(statxbuf +  24, s.gid)?;
+                    mem.write_u16(statxbuf +  28, s.mode as u16)?;
+                    mem.write_u64(statxbuf +  32, s.ino)?;
+                    mem.write_u64(statxbuf +  40, s.size as u64)?;
+                    mem.write_u64(statxbuf +  48, s.blocks as u64)?;
+                    mem.write_u64(statxbuf +  56, 0)?;      // stx_attributes_mask
+                    // timestamps: atime=+64, btime=+80, ctime=+96, mtime=+112
+                    for off in [64u64, 80, 96, 112] {
+                        mem.write_u64(statxbuf + off,      s.mtime as u64)?;
+                        mem.write_u32(statxbuf + off +  8, 0)?;
+                        mem.write_u32(statxbuf + off + 12, 0)?;
+                    }
+                    mem.write_u32(statxbuf + 128, (s.rdev >> 8) as u32)?;
+                    mem.write_u32(statxbuf + 132, (s.rdev & 0xff) as u32)?;
+                    mem.write_u32(statxbuf + 136, (s.dev >> 8) as u32)?;
+                    mem.write_u32(statxbuf + 140, (s.dev & 0xff) as u32)?;
+                    0
+                }
+                Err(_) => -ENOENT,
+            }
         }
 
         // ── truncate ──────────────────────────────────────────────────────
@@ -1235,6 +1369,32 @@ pub fn handle_syscall(
                 0
             } else { -ENOENT }
         }
+
+        // ── set_tid_address(tidptr) ───────────────────────────────────────
+        SYS_SET_TID_ADDRESS => ctx.current_tid as i64,
+
+        // ── mlock / munlock / mlockall / munlockall (no-ops) ─────────────
+        SYS_MLOCK | SYS_MUNLOCK | SYS_MLOCKALL | SYS_MUNLOCKALL => 0,
+
+        // ── personality (return PER_LINUX = 0) ───────────────────────────
+        SYS_PERSONALITY => 0,
+
+        // ── scheduler stubs ───────────────────────────────────────────────
+        SYS_SCHED_SETSCHEDULER | SYS_SCHED_GETSCHEDULER
+        | SYS_SCHED_SETPARAM   | SYS_SCHED_GETPARAM
+        | SYS_SCHED_SETAFFINITY => 0,
+
+        // ── getrusage(who, buf) ───────────────────────────────────────────
+        SYS_GETRUSAGE => {
+            // struct rusage is 18 × u64 on x86-64; zero-fill.
+            for i in 0..18u64 {
+                mem.write_u64(a1 + i * 8, 0).ok();
+            }
+            0
+        }
+
+        // ── renameat2 (flags-extended rename; stub as success) ────────────
+        SYS_RENAMEAT2 => 0,
 
         // ── unimplemented ─────────────────────────────────────────────────
         _ => {

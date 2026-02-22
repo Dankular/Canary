@@ -134,6 +134,24 @@ pub const SYS_RT_SIGRETURN:    u64 = 15;
 pub const SYS_TKILL:           u64 = 200;
 pub const SYS_TGKILL:          u64 = 234;
 
+// Memory locking
+pub const SYS_MLOCK:           u64 = 149;
+pub const SYS_MUNLOCK:         u64 = 150;
+pub const SYS_MLOCKALL:        u64 = 151;
+pub const SYS_MUNLOCKALL:      u64 = 152;
+
+// Process personality / scheduling
+pub const SYS_GETRUSAGE:          u64 = 98;
+pub const SYS_PERSONALITY:        u64 = 135;
+pub const SYS_SCHED_SETPARAM:     u64 = 142;
+pub const SYS_SCHED_GETPARAM:     u64 = 143;
+pub const SYS_SCHED_SETSCHEDULER: u64 = 144;
+pub const SYS_SCHED_GETSCHEDULER: u64 = 145;
+pub const SYS_SCHED_SETAFFINITY:  u64 = 203;
+
+// Thread-related
+pub const SYS_SET_TID_ADDRESS:    u64 = 218;
+
 // arch_prctl codes
 pub const ARCH_SET_FS: u64 = 0x1002;
 pub const ARCH_GET_FS: u64 = 0x1003;

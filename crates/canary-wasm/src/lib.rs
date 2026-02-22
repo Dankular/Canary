@@ -515,6 +515,8 @@ impl CanaryRuntime {
         self.ctx.threads       = canary_thread::ThreadTable::new(1);
         self.ctx.current_tid   = 1;
         self.ctx.pending_clone = Vec::new();
+        // Record the binary path for readlink("/proc/self/exe").
+        self.ctx.proc_exe = argv.first().cloned().unwrap_or_default();
 
         // ── 4. Map + load PT_LOAD segments for main ELF ───────────────────
         self.load_elf_segments(data, &elf)?;

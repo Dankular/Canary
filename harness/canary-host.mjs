@@ -195,12 +195,13 @@ function runIoPoll(rt) {
 
             if (vkPlugin) {
               const resp = vkPlugin.dispatch(cmd, payload, seq);
-              // Push response bytes back as IN reads.
-              if (resp instanceof Uint8Array) {
-                for (let i = 0; i < resp.length; i += 4) {
-                  const v = (resp[i] | (resp[i+1] << 8) |
-                             (resp[i+2] << 16) | (resp[i+3] << 24)) >>> 0;
-                  rt.push_io_read(WEBX_PORT, 4, v);
+              // Push response back as IN reads.
+              // Protocol: guest does inl (size=4) to read total byte count,
+              // then inb (size=1) per byte for the response body.
+              if (resp instanceof Uint8Array && resp.length > 0) {
+                rt.push_io_read(WEBX_PORT, 4, resp.length);
+                for (let i = 0; i < resp.length; i++) {
+                  rt.push_io_read(WEBX_PORT, 1, resp[i]);
                 }
               }
             }
@@ -306,8 +307,35 @@ export async function canaryMain() {
         api_version: '1.3.0'
       }
     })));
-    // /proc stubs needed by the Vulkan loader / glibc.
-    rt.add_file('/proc/version', enc.encode('Linux version 6.1.0-canary (gcc 12.3.0)'));
+    // ── /proc stubs needed by glibc / Wine / Vulkan loader ───────────────
+    rt.add_file('/proc/version',
+      enc.encode('Linux version 6.1.0-canary (gcc 12.3.0)\n'));
+    // /proc/self/exe is handled as a special case in readlink() by the Rust
+    // runtime (returns proc_exe = argv[0]).  We also add a regular file so
+    // that open("/proc/self/exe") succeeds for programs that try to re-read
+    // themselves.
+    rt.add_file('/proc/self/exe', enc.encode(BIN));
+    rt.add_file('/proc/self/cmdline',
+      enc.encode([BIN, ...ARGS].join('\0') + '\0'));
+    rt.add_file('/proc/self/comm',
+      enc.encode(BIN.split('/').pop() + '\n'));
+    rt.add_file('/proc/self/stat',
+      enc.encode('1 (canary) R 0 1 1 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0\n'));
+    rt.add_file('/proc/self/status',
+      enc.encode('Name:\tcanary\nState:\tR (running)\nPid:\t1\nPPid:\t0\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\nVmRSS:\t65536 kB\nVmPeak:\t65536 kB\n'));
+    rt.add_file('/proc/self/maps', enc.encode(''));  // empty; ntdll tolerates EOF
+    rt.add_file('/proc/cpuinfo', enc.encode(
+      'processor\t: 0\n' +
+      'vendor_id\t: GenuineIntel\n' +
+      'cpu family\t: 6\n' +
+      'model\t\t: 142\n' +
+      'model name\t: Intel(R) Core(TM) i7 (Canary Emulated)\n' +
+      'cpu MHz\t\t: 2400.000\n' +
+      'cache size\t: 8192 KB\n' +
+      'flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat ' +
+      'pse36 clflush mmx fxsr sse sse2 ht syscall nx rdtscp lm constant_tsc ' +
+      'pni pclmulqdq ssse3 fma cx16 pcid sse4_1 sse4_2 movbe popcnt aes xsave ' +
+      'avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch avx2 bmi1 bmi2\n'));
 
     // ── Start the WebSocket network bridge ────────────────────────────────
     // This RAF loop polls for connect/send events from the WASM module and
@@ -433,39 +461,52 @@ export async function canaryMain() {
     const argvJson = JSON.stringify([BIN, ...ARGS]);
     const envpJson = JSON.stringify(ENV);
 
-    const t0 = performance.now();
-    const exitCode = rt.run_elf(elfBytes, argvJson, envpJson);
-    const elapsed  = (performance.now() - t0).toFixed(0);
+    const ok = rt.prepare_elf(elfBytes, argvJson, envpJson);
+    if (!ok) {
+      print('[canary] ERROR: prepare_elf() failed — check console for details.', 'log-err');
+      setStatus('Prepare failed', 'error');
+      return;
+    }
 
-    // Drain any clone() requests queued during synchronous execution and spawn Workers.
-    try {
-      const cloneRequests = JSON.parse(rt.drain_clone_requests() || '[]');
-      for (const req of cloneRequests) {
-        spawnThread(req).catch(console.error);
+    // ── Step loop ─────────────────────────────────────────────────────────
+    // Drive execution via requestAnimationFrame batches so the browser can
+    // render frames, process events, and run the I/O bridges between bursts.
+    // This replaces the blocking rt.run_elf() call so long-running guests
+    // (Wine, shells, servers) don't freeze the tab.
+    const STEPS_PER_FRAME = 50_000;
+    const dec = new TextDecoder();
+
+    function stepLoop() {
+      let alive = true;
+      for (let i = 0; i < STEPS_PER_FRAME && alive; i++) {
+        alive = rt.step();
       }
-    } catch (_) {}
 
-    // ── Flush output ──────────────────────────────────────────────────────
-    const stdout = rt.drain_stdout();
-    const stderr = rt.drain_stderr();
+      // Stream stdout/stderr as it arrives rather than buffering until exit.
+      const out = rt.drain_stdout();
+      if (out.length > 0) print(dec.decode(out), 'log-stdout');
+      const err = rt.drain_stderr();
+      if (err.length > 0) print(dec.decode(err), 'log-stderr');
 
-    if (stdout.length > 0) {
-      const text = new TextDecoder().decode(stdout);
-      print('[stdout]\n' + text, 'log-stdout');
+      // Spawn any threads the guest cloned during this batch.
+      try {
+        const cloneRequests = JSON.parse(rt.drain_clone_requests() || '[]');
+        for (const req of cloneRequests) spawnThread(req).catch(console.error);
+      } catch (_) {}
+
+      if (alive) {
+        requestAnimationFrame(stepLoop);
+      } else {
+        // Guest exited or hit a fatal error — tear down.
+        if (fbAnimFrame !== null) cancelAnimationFrame(fbAnimFrame);
+        print('[canary] Process stopped.', 'log-ok');
+        setStatus('Done', '');
+        rt.free();
+      }
     }
-    if (stderr.length > 0) {
-      const text = new TextDecoder().decode(stderr);
-      print('[stderr]\n' + text, 'log-stderr');
-    }
 
-    // Stop the framebuffer render loop once the process has exited.
-    if (fbAnimFrame !== null) cancelAnimationFrame(fbAnimFrame);
-
-    print(`[canary] Process exited: ${exitCode}  (${elapsed} ms)`,
-          exitCode === 0 ? 'log-ok' : 'log-err');
-    setStatus(`Done (exit ${exitCode})`, exitCode === 0 ? '' : 'error');
-
-    rt.free();
+    requestAnimationFrame(stepLoop);
+    // canaryMain() returns here; stepLoop continues asynchronously.
   } catch (err) {
     print(`[canary] FATAL: ${err}\n${err.stack ?? ''}`, 'log-err');
     setStatus('Error', 'error');
