@@ -104,7 +104,7 @@ pub struct GuestMemory {
     mappings: BTreeMap<u64, Mapping>,
 
     /// Next available WASM offset for new allocations.
-    wasm_alloc_ptr: u32,
+    _wasm_alloc_ptr: u32,
 
     /// Next available guest address for anonymous mmap.
     mmap_brk: u64,
@@ -119,8 +119,12 @@ pub mod layout {
     pub const GUEST_BASE:       u64 = 0x0010_0000;
     /// Typical ELF load address for ET_EXEC / base for ET_DYN.
     pub const ELF_BASE:         u64 = 0x0040_0000;
+    /// Load address for the dynamic interpreter (ld-linux.so.2).
+    /// Placed at 256 MiB, safely above typical ELF text + BSS.
+    pub const INTERP_BASE:      u64 = 0x1000_0000;
     /// Start of the mmap / heap region (grows upward).
-    pub const MMAP_START:       u64 = 0x0800_0000;
+    /// Placed above INTERP_BASE + generous space for interpreter.
+    pub const MMAP_START:       u64 = 0x2000_0000;
     /// Stack base (grows downward from this address).
     pub const STACK_TOP:        u64 = 0xBFFF_F000;
     /// Stack size (8 MiB default).
@@ -130,14 +134,22 @@ pub mod layout {
 }
 
 impl GuestMemory {
-    /// Create a new guest memory with `total_bytes` backing store.
-    pub fn new(total_bytes: usize) -> Self {
+    /// Create a new guest memory.  The backing store starts empty and grows
+    /// lazily as pages are mapped — no up-front multi-GiB allocation.
+    pub fn new(_total_bytes: usize) -> Self {
         GuestMemory {
-            data:           vec![0u8; total_bytes],
+            data:           Vec::new(),
             mappings:       BTreeMap::new(),
-            wasm_alloc_ptr: 0,
+            _wasm_alloc_ptr: 0,
             mmap_brk:       layout::MMAP_START,
             program_brk:    layout::MMAP_START,
+        }
+    }
+
+    /// Grow the backing store to cover `[0, end)` if necessary.
+    fn ensure_capacity(&mut self, end: usize) {
+        if end > self.data.len() {
+            self.data.resize(end, 0);
         }
     }
 
@@ -165,11 +177,12 @@ impl GuestMemory {
     }
 
     /// Allocate a contiguous block in WASM memory (internal).
+    #[allow(dead_code)]
     fn wasm_alloc(&mut self, bytes: u64) -> MemResult<u32> {
-        let start = self.wasm_alloc_ptr;
+        let start = self._wasm_alloc_ptr;
         let end   = start.checked_add(bytes as u32).ok_or(MemError::OutOfMemory)?;
         if end as usize > self.data.len() { return Err(MemError::OutOfMemory); }
-        self.wasm_alloc_ptr = end;
+        self._wasm_alloc_ptr = end;
         Ok(start)
     }
 
@@ -202,9 +215,12 @@ impl GuestMemory {
             addr
         };
 
-        let wasm_offset = self.wasm_alloc(length)?;
-        // Zero the region.
-        let idx = wasm_offset as usize;
+        // Identity-map: guest VA == WASM byte index.
+        // This keeps loader_write(), brk(), and all callers consistent.
+        let wasm_offset = guest_start as u32;
+        let idx = guest_start as usize;
+        let end = idx.checked_add(length as usize).ok_or(MemError::OutOfMemory)?;
+        self.ensure_capacity(end);
         self.data[idx..idx + length as usize].fill(0);
 
         self.mappings.insert(guest_start, Mapping { guest_start, length, prot, wasm_offset });
@@ -285,20 +301,15 @@ impl GuestMemory {
 
     /// Directly write bytes (bypassing prot checks) for the ELF loader.
     pub fn loader_write(&mut self, guest_addr: u64, src: &[u8]) {
-        // Identity-mapped for addresses that fit in WASM memory.
-        // We map guest VA == WASM index for simplicity (bias must be set up
-        // by the caller).
         let idx = guest_addr as usize;
-        if let Some(dst) = self.data.get_mut(idx..idx + src.len()) {
-            dst.copy_from_slice(src);
-        }
+        self.ensure_capacity(idx + src.len());
+        self.data[idx..idx + src.len()].copy_from_slice(src);
     }
 
     pub fn loader_zero(&mut self, guest_addr: u64, len: usize) {
         let idx = guest_addr as usize;
-        if let Some(dst) = self.data.get_mut(idx..idx + len) {
-            dst.fill(0);
-        }
+        self.ensure_capacity(idx + len);
+        self.data[idx..idx + len].fill(0);
     }
 
     // ── Program break (heap) ──────────────────────────────────────────────
@@ -312,21 +323,30 @@ impl GuestMemory {
         let new_brk = page_align_up(new_brk);
         // Allocate extra pages if needed.
         if new_brk > old_brk {
-            // Just zero the pages in WASM memory (identity mapped).
             let idx = old_brk as usize;
             let len = (new_brk - old_brk) as usize;
-            if idx + len <= self.data.len() {
-                self.data[idx..idx + len].fill(0);
-                self.program_brk = new_brk;
-            }
+            self.ensure_capacity(idx + len);
+            self.data[idx..idx + len].fill(0);
+            self.program_brk = new_brk;
         }
         self.program_brk
     }
 }
 
-// ── GuestMemory impl for ELF loader trait ─────────────────────────────────────
+// ── ElfLoader trait ───────────────────────────────────────────────────────────
+//
+// Abstracts over the memory back-end used by the ELF loader.
+// Defined here (in canary-memory) so that:
+//   * canary-elf can depend on canary-memory and use the trait,
+//   * canary-memory can provide the impl for GuestMemory — all without
+//     creating a circular dependency.
 
-impl canary_elf::parser::GuestMemory for GuestMemory {
+pub trait ElfLoader {
+    fn write_bytes(&mut self, guest_addr: u64, data: &[u8]);
+    fn zero_bytes(&mut self, guest_addr: u64, len: usize);
+}
+
+impl ElfLoader for GuestMemory {
     fn write_bytes(&mut self, guest_addr: u64, data: &[u8]) {
         self.loader_write(guest_addr, data);
     }
@@ -334,3 +354,4 @@ impl canary_elf::parser::GuestMemory for GuestMemory {
         self.loader_zero(guest_addr, len);
     }
 }
+

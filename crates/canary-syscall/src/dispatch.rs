@@ -1,7 +1,7 @@
 //! Syscall dispatcher — called by the interpreter when SYSCALL is executed.
 
 use canary_memory::{GuestMemory, Prot, MapFlags};
-use canary_fs::{Vfs, OpenFlags, FsError};
+use canary_fs::Vfs;
 use crate::{numbers::*, errno::*, SyscallError};
 
 use std::collections::HashMap;
@@ -81,7 +81,7 @@ impl SyscallCtx {
 /// Returns the value to store in RAX (negative errno on failure).
 pub fn handle_syscall(
     nr:  u64,
-    a0:  u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64,
+    a0:  u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64,
     mem: &mut GuestMemory,
     ctx: &mut SyscallCtx,
     fs_base_out: &mut u64,
@@ -103,7 +103,7 @@ pub fn handle_syscall(
                     0
                 }
                 _ => {
-                    let ofd = ctx.fds.get_mut(fd).ok_or(SyscallError::Mem(canary_memory::MemError::WasmBounds))?;
+                    let ofd = match ctx.fds.get_mut(fd) { Some(f) => f, None => return Ok(-EBADF) };
                     let ino    = ofd.ino;
                     let offset = ofd.offset;
                     let node = ctx.vfs.mem.node(ino);
@@ -130,7 +130,7 @@ pub fn handle_syscall(
                 1 => { ctx.stdout_buf.extend_from_slice(&data); count as i64 }
                 2 => { ctx.stderr_buf.extend_from_slice(&data); count as i64 }
                 _ => {
-                    let ofd = ctx.fds.get_mut(fd).ok_or(-EBADF)?;
+                    let ofd = match ctx.fds.get_mut(fd) { Some(f) => f, None => return Ok(-EBADF) };
                     let ino = ofd.ino;
                     let off = ofd.offset as usize;
                     let node = ctx.vfs.mem.node_mut(ino);
@@ -204,7 +204,7 @@ pub fn handle_syscall(
             let fd     = a0;
             let offset = a1 as i64;
             let whence = a2;
-            let ofd = ctx.fds.get_mut(fd).ok_or(-EBADF)?;
+            let ofd = match ctx.fds.get_mut(fd) { Some(f) => f, None => return Ok(-EBADF) };
             let node = ctx.vfs.mem.node(ofd.ino);
             let file_size = node.content.len() as i64;
             let new_off = match whence {
@@ -231,7 +231,7 @@ pub fn handle_syscall(
             }
         }
         SYS_FSTAT => {
-            let ofd = ctx.fds.get(a0).ok_or(-EBADF)?;
+            let ofd = match ctx.fds.get(a0) { Some(f) => f, None => return Ok(-EBADF) };
             let ino = ofd.ino;
             let stat = ctx.vfs.mem.node(ino).stat.clone();
             write_stat(mem, a1, stat)?;
@@ -255,18 +255,21 @@ pub fn handle_syscall(
             let length = a1;
             let prot   = linux_prot_to_canary(a2);
             let flags  = linux_map_flags_to_canary(a3);
-            let fd     = a4;
-            let _off   = a5;
+            let fd     = a4 as i64;
+            let off    = a5 as usize;
 
             match mem.mmap(addr, length, prot, flags) {
                 Ok(mapped) => {
-                    // If fd >= 0, load file content at mapped address.
-                    if fd < u64::MAX - 1000 {
-                        if let Some(ofd) = ctx.fds.get(fd) {
+                    // If fd >= 0, load file content from offset into mapped address.
+                    if fd >= 0 {
+                        if let Some(ofd) = ctx.fds.get(fd as u64) {
                             let ino = ofd.ino;
                             let content = ctx.vfs.mem.node(ino).content.clone();
-                            let n = content.len().min(length as usize);
-                            mem.loader_write(mapped, &content[..n]);
+                            let available = content.len().saturating_sub(off);
+                            let n = (length as usize).min(available);
+                            if n > 0 {
+                                mem.loader_write(mapped, &content[off..off + n]);
+                            }
                         }
                     }
                     mapped as i64
@@ -437,7 +440,7 @@ pub fn handle_syscall(
             let old_addr = a0;
             let old_size = a1;
             let new_size = a2;
-            let flags    = a3;
+            let _flags   = a3;
             match mem.mmap(0, new_size, Prot::READ | Prot::WRITE, MapFlags::PRIVATE | MapFlags::ANONYMOUS) {
                 Ok(new_addr) => {
                     let copy_size = old_size.min(new_size) as usize;
@@ -458,7 +461,7 @@ pub fn handle_syscall(
             let buf = a0;
             let len = a1 as usize;
             for i in 0..len {
-                mem.write_u8(buf + i as u64, (i.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) & 0xFF) as u8)?;
+                mem.write_u8(buf + i as u64, ((i as u64).wrapping_mul(6364136223846793005u64).wrapping_add(1442695040888963407u64) & 0xFF) as u8)?;
             }
             len as i64
         }
@@ -577,6 +580,225 @@ pub fn handle_syscall(
             mem.write_u32(a0, rfd as u32)?;
             mem.write_u32(a0 + 4, wfd as u32)?;
             0
+        }
+
+        // ── pread64(fd, buf, count, offset) ──────────────────────────────
+        SYS_PREAD64 => {
+            let fd     = a0;
+            let buf    = a1;
+            let count  = a2 as usize;
+            let offset = a3 as usize;
+            let ofd = match ctx.fds.get(fd) { Some(f) => f, None => return Ok(-EBADF) };
+            let ino    = ofd.ino;
+            let node   = ctx.vfs.mem.node(ino);
+            let start  = offset;
+            let avail  = node.content.len().saturating_sub(start);
+            let n      = count.min(avail);
+            if n > 0 {
+                let slice = &node.content[start..start + n];
+                mem.write_bytes_at(buf, slice)?;
+            }
+            n as i64
+        }
+
+        // ── getdents64(fd, buf, count) ───────────────────────────────────
+        SYS_GETDENTS64 | SYS_GETDENTS => {
+            let fd       = a0;
+            let buf_ptr  = a1;
+            let buf_size = a2 as usize;
+
+            let (ino, pos) = match ctx.fds.get(fd) {
+                Some(f) => (f.ino, f.offset as usize),
+                None    => return Ok(-EBADF),
+            };
+
+            let node = ctx.vfs.mem.node(ino);
+            if node.kind != canary_fs::FileKind::Directory {
+                return Ok(-ENOTDIR);
+            }
+
+            // Collect entries: "." and ".." first, then children sorted by name.
+            let mut all: Vec<(String, u64, u8)> = vec![
+                (".".into(),  ino as u64, 4u8),
+                ("..".into(), 0u64,       4u8),
+            ];
+            for (name, &child_ino) in &node.children {
+                let d_type: u8 = match ctx.vfs.mem.node(child_ino).kind {
+                    canary_fs::FileKind::Regular    => 8,
+                    canary_fs::FileKind::Directory  => 4,
+                    canary_fs::FileKind::Symlink    => 10,
+                    canary_fs::FileKind::CharDevice => 2,
+                    canary_fs::FileKind::BlockDevice=> 6,
+                    _                               => 0,
+                };
+                all.push((name.clone(), child_ino as u64, d_type));
+            }
+            all[2..].sort_by(|a, b| a.0.cmp(&b.0));
+
+            let mut written  = 0usize;
+            let mut new_pos  = pos;
+
+            for (name, d_ino, d_type) in all.iter().skip(pos) {
+                let name_bytes = name.as_bytes();
+                // dirent64: u64 ino + i64 off + u16 reclen + u8 type + name + NUL, aligned to 8
+                let reclen = ((19 + name_bytes.len() + 1) + 7) & !7usize;
+                if written + reclen > buf_size { break; }
+
+                let base = buf_ptr + written as u64;
+                mem.write_u64(base,      *d_ino)?;
+                mem.write_u64(base + 8,  new_pos as u64 + 1)?;
+                mem.write_u16(base + 16, reclen as u16)?;
+                mem.write_u8 (base + 18, *d_type)?;
+                mem.write_bytes_at(base + 19, name_bytes)?;
+                mem.write_u8(base + 19 + name_bytes.len() as u64, 0)?;
+
+                written  += reclen;
+                new_pos  += 1;
+            }
+
+            ctx.fds.get_mut(fd).unwrap().offset = new_pos as u64;
+            written as i64
+        }
+
+        // ── dup3(old, new, flags) ─────────────────────────────────────────
+        SYS_DUP3 => {
+            let old = a0;
+            let new = a1;
+            if let Some(ofd) = ctx.fds.get(old) {
+                let ino   = ofd.ino;
+                let flags = ofd.flags;
+                ctx.fds.fds.insert(new, OpenFd { ino, flags, offset: 0 });
+                new as i64
+            } else { -EBADF }
+        }
+
+        // ── ftruncate(fd, length) ─────────────────────────────────────────
+        SYS_FTRUNCATE => {
+            let fd  = a0;
+            let len = a1 as usize;
+            let ofd = match ctx.fds.get(fd) { Some(f) => f, None => return Ok(-EBADF) };
+            let ino = ofd.ino;
+            let node = ctx.vfs.mem.node_mut(ino);
+            node.content.resize(len, 0);
+            node.stat.size = len as i64;
+            0
+        }
+
+        // ── unlink / unlinkat ─────────────────────────────────────────────
+        SYS_UNLINK | SYS_UNLINKAT => {
+            // Stub: pretend success for now.
+            0
+        }
+
+        // ── rename / renameat ─────────────────────────────────────────────
+        SYS_RENAME | SYS_RENAMEAT => {
+            // Stub: pretend success.
+            0
+        }
+
+        // ── rmdir ─────────────────────────────────────────────────────────
+        SYS_RMDIR => 0,
+
+        // ── symlink ───────────────────────────────────────────────────────
+        SYS_SYMLINK => {
+            let target = mem.read_cstr(a0)?;
+            let path   = mem.read_cstr(a1)?;
+            let abs    = resolve_path(&ctx.cwd, &path);
+            ctx.vfs.mem.symlink(&abs, &target).map_or(0, |_| 0)
+        }
+
+        // ── chmod / fchmod / chown / fchown (stubs) ───────────────────────
+        SYS_CHMOD | SYS_FCHMOD | SYS_CHOWN | SYS_FCHOWN | SYS_LCHOWN
+        | SYS_FCHMODAT => 0,
+
+        // ── setuid / setgid / setsid / setpgid ───────────────────────────
+        SYS_SETUID => { ctx.uid = a0 as u32; 0 }
+        SYS_SETGID => { ctx.gid = a0 as u32; 0 }
+        SYS_SETSID | SYS_SETPGID | SYS_SETGROUPS => 0,
+        SYS_GETGROUPS => {
+            // Return 0 supplementary groups.
+            if a0 > 0 { mem.write_u32(a1, 0).ok(); }
+            0
+        }
+
+        // ── kill (stub) ───────────────────────────────────────────────────
+        SYS_KILL => 0,
+
+        // ── wait4 (stub — no child processes) ────────────────────────────
+        SYS_WAIT4 => -ECHILD,
+
+        // ── clone / fork (stubs) ─────────────────────────────────────────
+        SYS_CLONE | SYS_FORK => {
+            // Return ENOSYS; a single-threaded emulator can't fork.
+            -ENOSYS
+        }
+
+        // ── execve (stub) ─────────────────────────────────────────────────
+        SYS_EXECVE => -ENOSYS,
+
+        // ── prctl (stub) ──────────────────────────────────────────────────
+        SYS_PRCTL => 0,
+
+        // ── sigaltstack (stub) ────────────────────────────────────────────
+        SYS_SIGALTSTACK => 0,
+
+        // ── prlimit64(pid, resource, new, old) ───────────────────────────
+        SYS_PRLIMIT64 => {
+            if a3 != 0 {
+                // Write generous limits into *old.
+                mem.write_u64(a3,     u64::MAX)?;
+                mem.write_u64(a3 + 8, u64::MAX)?;
+            }
+            0
+        }
+
+        // ── poll / select / pselect / ppoll (stubs) ──────────────────────
+        SYS_POLL | SYS_SELECT | SYS_PSELECT6 | SYS_PPOLL => 0,
+
+        // ── socket / connect / send / recv stubs ─────────────────────────
+        SYS_SOCKET => -ENOSYS,
+        SYS_CONNECT | SYS_BIND | SYS_LISTEN | SYS_ACCEPT | SYS_ACCEPT4
+        | SYS_SENDTO | SYS_RECVFROM | SYS_SENDMSG | SYS_RECVMSG
+        | SYS_SETSOCKOPT | SYS_GETSOCKOPT | SYS_GETSOCKNAME | SYS_GETPEERNAME
+        | SYS_SOCKETPAIR | SYS_SENDMMSG | SYS_RECVMMSG => -ENOSYS,
+
+        // ── epoll stubs ───────────────────────────────────────────────────
+        SYS_EPOLL_CREATE | SYS_EPOLL_CREATE1 => {
+            // Return a fake epoll fd.
+            ctx.vfs.mem.write_file("/epoll", vec![]).ok();
+            let ino = ctx.vfs.mem.lookup("/epoll").unwrap_or(0);
+            ctx.fds.alloc(ino, 0) as i64
+        }
+        SYS_EPOLL_CTL | SYS_EPOLL_WAIT => 0,
+
+        // ── eventfd2 / timerfd / inotify stubs ───────────────────────────
+        SYS_EVENTFD2 | SYS_TIMERFD_CREATE | SYS_TIMERFD_SETTIME
+        | SYS_TIMERFD_GETTIME | SYS_INOTIFY_INIT1 => {
+            ctx.vfs.mem.write_file("/fd_stub", vec![]).ok();
+            let ino = ctx.vfs.mem.lookup("/fd_stub").unwrap_or(0);
+            ctx.fds.alloc(ino, 0) as i64
+        }
+
+        // ── utimensat / utime (stub) ──────────────────────────────────────
+        SYS_UTIMENSAT => 0,
+
+        // ── statx (forward to stat) ───────────────────────────────────────
+        SYS_STATX => {
+            // a1 = path, a4 = buf (statx_buf), simplified: return ENOSYS
+            -ENOSYS
+        }
+
+        // ── truncate ──────────────────────────────────────────────────────
+        SYS_TRUNCATE => {
+            let path = mem.read_cstr(a0)?;
+            let abs  = resolve_path(&ctx.cwd, &path);
+            let len  = a1 as usize;
+            if let Ok(ino) = ctx.vfs.mem.lookup(&abs) {
+                let node = ctx.vfs.mem.node_mut(ino);
+                node.content.resize(len, 0);
+                node.stat.size = len as i64;
+                0
+            } else { -ENOENT }
         }
 
         // ── unimplemented ─────────────────────────────────────────────────

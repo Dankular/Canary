@@ -220,7 +220,7 @@ impl<'a> ByteReader<'a> {
 
 // ── ModRM + SIB + displacement decoder ───────────────────────────────────────
 
-fn decode_mem(reader: &mut ByteReader, modrm: ModRm, pfx: &Prefixes, rip_after: u64)
+fn decode_mem(reader: &mut ByteReader, modrm: ModRm, pfx: &Prefixes, _rip_after: u64)
     -> DecodeResult<MemAddr>
 {
     let rex_b = pfx.rex_b();
@@ -338,8 +338,8 @@ fn decode_opcode(
     opcode:   u8,
     pfx:      &Prefixes,
     op_size:  u8,
-    addr_size: u8,
-    rip:      u64,
+    _addr_size: u8,
+    rip:       u64,
 ) -> DecodeResult<(Mnemonic, u8, Vec<Operand>)> {
     use Mnemonic::*;
     use Operand::*;

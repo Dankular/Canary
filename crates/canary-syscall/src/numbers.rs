@@ -93,6 +93,42 @@ pub const SYS_MEMFD_CREATE:    u64 = 319;
 pub const SYS_STATX:           u64 = 332;
 pub const SYS_RSEQ:            u64 = 334;
 
+// Additional syscalls not in the original list
+pub const SYS_ACCEPT:          u64 = 43;
+pub const SYS_SENDMSG:         u64 = 46;
+pub const SYS_RECVMSG:         u64 = 47;
+pub const SYS_BIND:            u64 = 49;
+pub const SYS_LISTEN:          u64 = 50;
+pub const SYS_GETSOCKNAME:     u64 = 51;
+pub const SYS_GETPEERNAME:     u64 = 52;
+pub const SYS_SOCKETPAIR:      u64 = 53;
+pub const SYS_SETSOCKOPT:      u64 = 54;
+pub const SYS_GETSOCKOPT:      u64 = 55;
+pub const SYS_TRUNCATE:        u64 = 76;
+pub const SYS_SYMLINK:         u64 = 88;
+pub const SYS_CHMOD:           u64 = 90;
+pub const SYS_FCHMOD:          u64 = 91;
+pub const SYS_CHOWN:           u64 = 92;
+pub const SYS_FCHOWN:          u64 = 93;
+pub const SYS_LCHOWN:          u64 = 94;
+pub const SYS_SIGALTSTACK:     u64 = 131;
+pub const SYS_PRCTL:           u64 = 157;
+pub const SYS_EPOLL_CREATE:    u64 = 213;
+pub const SYS_GETDENTS64:      u64 = 217;
+pub const SYS_EPOLL_WAIT:      u64 = 232;
+pub const SYS_EPOLL_CTL:       u64 = 233;
+pub const SYS_ACCEPT4:         u64 = 288;
+pub const SYS_EVENTFD2:        u64 = 290;
+pub const SYS_DUP3:            u64 = 292;
+pub const SYS_INOTIFY_INIT1:   u64 = 294;
+pub const SYS_RECVMMSG:        u64 = 299;
+pub const SYS_PRLIMIT64:       u64 = 302;
+pub const SYS_SENDMMSG:        u64 = 307;
+pub const SYS_RENAMEAT2:       u64 = 316;
+pub const SYS_TIMERFD_CREATE:  u64 = 283;
+pub const SYS_TIMERFD_SETTIME: u64 = 286;
+pub const SYS_TIMERFD_GETTIME: u64 = 287;
+
 // arch_prctl codes
 pub const ARCH_SET_FS: u64 = 0x1002;
 pub const ARCH_GET_FS: u64 = 0x1003;

@@ -269,10 +269,11 @@ impl Elf64 {
     ///
     /// `memory` is indexed from 0 — callers must map virtual addresses to
     /// memory indices themselves (typically `vaddr - memory_base`).
-    pub fn load_into<M: GuestMemory>(&self, file_data: &[u8], mem: &mut M) -> ElfResult<()> {
+    pub fn load_into<M: canary_memory::ElfLoader>(&self, file_data: &[u8], mem: &mut M) -> ElfResult<()> {
         for seg in &self.load_segs {
             let file_start = seg.offset as usize;
             let file_end   = file_start + seg.filesz as usize;
+            if file_end > file_data.len() { continue; }
             let src = &file_data[file_start..file_end];
             mem.write_bytes(seg.vaddr, src);
             // Zero BSS (memsz > filesz).
@@ -284,10 +285,4 @@ impl Elf64 {
         }
         Ok(())
     }
-}
-
-/// Trait that abstracts over whatever backing memory store is used.
-pub trait GuestMemory {
-    fn write_bytes(&mut self, guest_addr: u64, data: &[u8]);
-    fn zero_bytes(&mut self, guest_addr: u64, len: usize);
 }

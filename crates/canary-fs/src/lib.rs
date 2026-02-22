@@ -5,6 +5,8 @@
 //! - `Ext2Fs`  — ext2 disk image loaded from a byte slice
 //! - `OverlayFs` — writable layer over a read-only base
 
+pub mod ext2;
+
 use thiserror::Error;
 use std::collections::HashMap;
 
@@ -140,7 +142,7 @@ impl VNode {
 
 pub struct MemFs {
     nodes: Vec<VNode>,
-    /// Root inode is always 0.
+    // Root inode is always 0.
 }
 
 impl MemFs {
@@ -157,7 +159,7 @@ impl MemFs {
 
     /// Resolve an absolute path to an inode index.
     pub fn lookup(&self, path: &str) -> FsResult<usize> {
-        let mut current = 0usize;
+        let current = 0usize;
         let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
         let mut followed = 0;
         self.lookup_from(current, &parts, &mut followed)
@@ -211,7 +213,7 @@ impl MemFs {
     pub fn write_file(&mut self, path: &str, content: Vec<u8>) -> FsResult<()> {
         let (dir_path, file_name) = split_path(path);
         let dir_ino = self.mkdir_p(dir_path)?;
-        let file_ino = if let Some(&existing) = self.nodes[dir_ino].children.get(file_name) {
+        let _file_ino = if let Some(&existing) = self.nodes[dir_ino].children.get(file_name) {
             self.nodes[existing].content = content.clone();
             self.nodes[existing].stat.size = content.len() as i64;
             existing
@@ -257,12 +259,12 @@ pub struct FileHandle {
 pub struct Vfs {
     pub mem: MemFs,
     /// Next inode number for new files.
-    next_ino: usize,
+    _next_ino: usize,
 }
 
 impl Vfs {
     pub fn new() -> Self {
-        let mut vfs = Vfs { mem: MemFs::new(), next_ino: 2 };
+        let mut vfs = Vfs { mem: MemFs::new(), _next_ino: 2 };
         vfs.setup_proc();
         vfs.setup_dev();
         vfs

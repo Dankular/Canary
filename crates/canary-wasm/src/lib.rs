@@ -41,17 +41,67 @@ impl CanaryRuntime {
         }
     }
 
-    /// Load a filesystem image (raw bytes of a tar archive or ext2 image).
-    /// For now, this is a no-op placeholder — callers use `add_file`.
+    /// Load a filesystem image (raw ext2 image bytes).
+    /// Populates the virtual filesystem from the image.
     #[wasm_bindgen]
-    pub fn load_fs_image(&mut self, _data: &[u8]) {
-        log("Canary: load_fs_image called (stub)");
+    pub fn load_fs_image(&mut self, data: &[u8]) {
+        log(&format!("Canary: loading ext2 image ({} bytes)...", data.len()));
+        if canary_fs::ext2::populate_memfs(data, &mut self.ctx.vfs.mem) {
+            log("Canary: ext2 filesystem loaded successfully");
+        } else {
+            warn("Canary: load_fs_image — not a valid ext2 image, ignoring");
+        }
     }
 
     /// Add a single file to the virtual filesystem.
     #[wasm_bindgen]
     pub fn add_file(&mut self, path: &str, data: &[u8]) {
         self.ctx.vfs.mem.write_file(path, data.to_vec()).ok();
+    }
+
+    /// Read a file from the virtual filesystem.
+    /// Returns the file content as a Uint8Array, or null if not found.
+    #[wasm_bindgen]
+    pub fn read_file(&self, path: &str) -> Option<Vec<u8>> {
+        let ino = self.ctx.vfs.mem.lookup(path).ok()?;
+        let node = self.ctx.vfs.mem.node(ino);
+        // Don't return directory content.
+        if node.kind == canary_fs::FileKind::Directory {
+            return None;
+        }
+        Some(node.content.clone())
+    }
+
+    /// Check if a path exists in the VFS.
+    #[wasm_bindgen]
+    pub fn path_exists(&self, path: &str) -> bool {
+        self.ctx.vfs.mem.lookup(path).is_ok()
+    }
+
+    /// List directory entries as a JSON array of {name, kind} objects.
+    #[wasm_bindgen]
+    pub fn list_dir(&self, path: &str) -> String {
+        match self.ctx.vfs.mem.lookup(path) {
+            Ok(ino) => {
+                let node = self.ctx.vfs.mem.node(ino);
+                if node.kind != canary_fs::FileKind::Directory {
+                    return "[]".into();
+                }
+                let entries: Vec<String> = node.children.iter()
+                    .map(|(name, &child_ino)| {
+                        let kind = match self.ctx.vfs.mem.node(child_ino).kind {
+                            canary_fs::FileKind::Directory => "dir",
+                            canary_fs::FileKind::Symlink   => "link",
+                            _                              => "file",
+                        };
+                        format!(r#"{{"name":{},"kind":"{}"}}"#,
+                            serde_json::to_string(name).unwrap_or_default(), kind)
+                    })
+                    .collect();
+                format!("[{}]", entries.join(","))
+            }
+            Err(_) => "[]".into(),
+        }
     }
 
     /// Load and execute a 64-bit ELF binary.
@@ -75,7 +125,7 @@ impl CanaryRuntime {
         }
     }
 
-    /// Execute a single SYSCALL instruction's effects externally.
+    /// Execute a single instruction step.  Returns false when the program ends.
     #[wasm_bindgen]
     pub fn step(&mut self) -> bool {
         self.step_inner()
@@ -93,7 +143,7 @@ impl CanaryRuntime {
         std::mem::take(&mut self.ctx.stderr_buf)
     }
 
-    /// Write bytes into the stdin buffer (not yet consumed by read syscall).
+    /// Write bytes into the stdin buffer.
     #[wasm_bindgen]
     pub fn write_stdin(&mut self, data: &[u8]) {
         // TODO: pipe into stdin fd.
@@ -155,59 +205,74 @@ impl std::fmt::Display for CanaryError {
 
 impl CanaryRuntime {
     fn run_elf_inner(&mut self, data: &[u8], argv: &[String], envp: &[String]) -> Result<i32, CanaryError> {
-        // ── 1. Parse ELF ──────────────────────────────────────────────────
+        // ── 1. Parse main ELF ─────────────────────────────────────────────
         let elf = Elf64::parse(data, layout::ELF_BASE)?;
         log(&format!(
-            "Canary: loading ELF @ base={:#x} entry={:#x} ({} PT_LOAD segments)",
-            elf.load_base, elf.entry, elf.load_segs.len()
+            "Canary: loading ELF @ base={:#x} entry={:#x} ({} PT_LOAD segs) interp={:?}",
+            elf.load_base, elf.entry, elf.load_segs.len(), elf.interp
         ));
 
-        // ── 2. Map pages for all PT_LOAD segments ─────────────────────────
-        for seg in &elf.load_segs {
-            let prot = {
-                let mut p = Prot::NONE;
-                if seg.flags & canary_elf::PF_R != 0 { p |= Prot::READ; }
-                if seg.flags & canary_elf::PF_W != 0 { p |= Prot::WRITE; }
-                if seg.flags & canary_elf::PF_X != 0 { p |= Prot::EXEC; }
-                p
-            };
-            self.mem.mmap(seg.vaddr, seg.memsz, prot | Prot::WRITE, MapFlags::FIXED | MapFlags::PRIVATE | MapFlags::ANONYMOUS)
-                .map_err(|e| CanaryError::Exec(e.to_string()))?;
-        }
+        // ── 2. Reset memory state for a fresh execution ───────────────────
+        self.mem  = GuestMemory::new(layout::TOTAL_WASM_BYTES);
+        self.cpu  = CpuState::default();
+        // Keep ctx.vfs (filesystem) but reset fds.
+        self.ctx.fds = canary_syscall::dispatch::FdTable::new();
+        self.ctx.cwd = "/".to_string();
+        self.ctx.stdout_buf.clear();
+        self.ctx.stderr_buf.clear();
 
-        // ── 3. Load file content into virtual memory ───────────────────────
-        elf.load_into(data, &mut self.mem)
-            .map_err(|e| CanaryError::Exec(e.to_string()))?;
+        // ── 3. Map + load PT_LOAD segments for main ELF ───────────────────
+        self.load_elf_segments(data, &elf)?;
 
-        // ── 4. Map stack ──────────────────────────────────────────────────
+        // ── 4. Optionally load the dynamic interpreter ─────────────────────
+        let (interp_base, interp_entry) = if let Some(ref interp_path) = elf.interp {
+            match self.load_interpreter(interp_path) {
+                Ok((base, entry)) => {
+                    log(&format!("Canary: interpreter loaded @ base={:#x} entry={:#x}", base, entry));
+                    (base, entry)
+                }
+                Err(e) => {
+                    warn(&format!("Canary: failed to load interpreter '{}': {e}", interp_path));
+                    warn("Canary: attempting to run as static binary (likely to fail for glibc)");
+                    (0, elf.entry)
+                }
+            }
+        } else {
+            (0, elf.entry)
+        };
+
+        // The CPU will start at the interpreter's entry (or the ELF entry for static).
+        let start_rip = if interp_base != 0 { interp_entry } else { elf.entry };
+
+        // ── 5. Map stack ──────────────────────────────────────────────────
         let stack_base = layout::STACK_TOP - layout::STACK_SIZE;
-        self.mem.mmap(stack_base, layout::STACK_SIZE, Prot::READ | Prot::WRITE,
+        self.mem.mmap(stack_base, layout::STACK_SIZE,
+                      Prot::READ | Prot::WRITE,
                       MapFlags::FIXED | MapFlags::PRIVATE | MapFlags::ANONYMOUS)
             .map_err(|e| CanaryError::Exec(e.to_string()))?;
 
-        // ── 5. Build auxv + initial stack ─────────────────────────────────
+        // ── 6. Build auxv + initial stack ─────────────────────────────────
         let phdr_addr  = elf.load_base + elf.header.e_phoff;
         let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
         let envp_refs: Vec<&str> = envp.iter().map(|s| s.as_str()).collect();
+
         let auxv = build_auxv(
             phdr_addr,
-            56, // sizeof Elf64Phdr
+            56,                             // sizeof Elf64Phdr
             elf.header.e_phnum as u64,
-            0,  // no interpreter (static binary for now)
-            elf.entry,
-            0, 0,
+            interp_base,                    // AT_BASE = interp load addr (0 = static)
+            elf.entry,                      // AT_ENTRY = main ELF entry
+            0, 0,                           // patched by build_initial_stack
         );
         let stack = build_initial_stack(layout::STACK_TOP, &argv_refs, &envp_refs, &auxv, [0u8; 16]);
         self.mem.loader_write(stack.rsp, &stack.data);
 
-        // ── 6. Set up CPU state ───────────────────────────────────────────
-        self.cpu = CpuState::default();
-        self.cpu.rip = elf.entry;
+        // ── 7. Set up CPU state ───────────────────────────────────────────
+        self.cpu.rip = start_rip;
         self.cpu.gpr[canary_cpu::registers::reg::RSP] = stack.rsp;
-        // x86-64 ABI: RDX = 0 (no atexit for static), clear direction flag.
 
-        // ── 7. Run the interpreter loop ───────────────────────────────────
-        log(&format!("Canary: starting execution at {:#x}", self.cpu.rip));
+        // ── 8. Run interpreter loop ───────────────────────────────────────
+        log(&format!("Canary: executing from {:#x}", self.cpu.rip));
         loop {
             match self.step_once() {
                 Ok(()) => {}
@@ -217,8 +282,55 @@ impl CanaryRuntime {
         }
     }
 
+    /// Load all PT_LOAD segments of `elf` from `data` into guest memory.
+    fn load_elf_segments(&mut self, data: &[u8], elf: &Elf64) -> Result<(), CanaryError> {
+        for seg in &elf.load_segs {
+            let prot = {
+                let mut p = Prot::NONE;
+                if seg.flags & canary_elf::PF_R != 0 { p |= Prot::READ; }
+                if seg.flags & canary_elf::PF_W != 0 { p |= Prot::WRITE; }
+                if seg.flags & canary_elf::PF_X != 0 { p |= Prot::EXEC; }
+                p
+            };
+            self.mem.mmap(seg.vaddr, seg.memsz, prot | Prot::WRITE,
+                          MapFlags::FIXED | MapFlags::PRIVATE | MapFlags::ANONYMOUS)
+                .map_err(|e| CanaryError::Exec(e.to_string()))?;
+        }
+        elf.load_into(data, &mut self.mem)
+            .map_err(|e| CanaryError::Exec(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Load the dynamic interpreter (ld-linux-x86-64.so.2) from VFS.
+    /// Returns `(load_base, entry_point)`.
+    fn load_interpreter(&mut self, interp_path: &str) -> Result<(u64, u64), CanaryError> {
+        // Look up the interpreter in the VFS (two-step to avoid borrow conflicts).
+        let ino = self.ctx.vfs.mem.lookup(interp_path)
+            .map_err(|_| CanaryError::Exec(format!("interpreter not found: {interp_path}")))?;
+
+        let interp_data = {
+            let node = self.ctx.vfs.mem.node(ino);
+            if node.content.is_empty() {
+                return Err(CanaryError::Exec(format!("interpreter file empty: {interp_path}")));
+            }
+            node.content.clone()
+        };
+
+        // Parse the interpreter ELF (always a PIE/ET_DYN); load at INTERP_BASE.
+        let interp_elf = Elf64::parse(&interp_data, layout::INTERP_BASE)
+            .map_err(|e| CanaryError::Exec(format!("interpreter parse error: {e}")))?;
+
+        log(&format!(
+            "Canary: interpreter ELF: base={:#x} entry={:#x} segs={}",
+            interp_elf.load_base, interp_elf.entry, interp_elf.load_segs.len()
+        ));
+
+        self.load_elf_segments(&interp_data, &interp_elf)?;
+
+        Ok((interp_elf.load_base, interp_elf.entry))
+    }
+
     fn step_once(&mut self) -> Result<(), CanaryError> {
-        // Read up to 15 bytes for the instruction.
         let rip = self.cpu.rip;
         let bytes = self.mem.read_bytes(rip, 15)
             .or_else(|_| self.mem.read_bytes(rip, 1))
@@ -230,24 +342,14 @@ impl CanaryRuntime {
 
         match execute(&instr, &mut self.cpu, &mut self.mem) {
             Ok(()) => Ok(()),
-            Err(ExecError::Syscall) => {
-                self.dispatch_syscall()
-            }
-            Err(ExecError::Halt) => {
-                Err(CanaryError::Exit(0))
-            }
-            Err(ExecError::DivideByZero) => {
-                Err(CanaryError::Exec("divide by zero".into()))
-            }
+            Err(ExecError::Syscall) => self.dispatch_syscall(),
+            Err(ExecError::Halt)    => Err(CanaryError::Exit(0)),
+            Err(ExecError::DivideByZero)     => Err(CanaryError::Exec("divide by zero".into())),
             Err(ExecError::IllegalInstruction) => {
                 Err(CanaryError::Exec(format!("illegal instruction @{rip:#x}")))
             }
-            Err(ExecError::Int(n)) => {
-                Err(CanaryError::Exec(format!("INT {n} @{rip:#x}")))
-            }
-            Err(e) => {
-                Err(CanaryError::Exec(e.to_string()))
-            }
+            Err(ExecError::Int(n)) => Err(CanaryError::Exec(format!("INT {n} @{rip:#x}"))),
+            Err(e) => Err(CanaryError::Exec(e.to_string())),
         }
     }
 
@@ -286,8 +388,8 @@ impl CanaryRuntime {
 
     fn step_inner(&mut self) -> bool {
         match self.step_once() {
-            Ok(())                       => true,
-            Err(CanaryError::Exit(_))    => false,
+            Ok(())                    => true,
+            Err(CanaryError::Exit(_)) => false,
             Err(e) => {
                 error(&format!("Canary step error: {e}"));
                 false
@@ -298,7 +400,4 @@ impl CanaryRuntime {
 
 // ── panic hook ────────────────────────────────────────────────────────────────
 
-fn console_error_panic_hook_init() {
-    #[cfg(feature = "console_error_panic_hook")]
-    console_error_panic_hook::set_once();
-}
+fn console_error_panic_hook_init() {}

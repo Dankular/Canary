@@ -6,6 +6,9 @@ edition.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
 [dependencies]
 wasm-bindgen.workspace = true
 js-sys.workspace = true
@@ -13,6 +16,7 @@ web-sys.workspace = true
 log.workspace = true
 thiserror.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 canary-elf      = { path = "../canary-elf" }
 canary-cpu      = { path = "../canary-cpu" }
 canary-memory   = { path = "../canary-memory" }

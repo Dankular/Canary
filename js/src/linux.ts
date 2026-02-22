@@ -155,7 +155,8 @@ export class Linux {
       throw new Error(`Canary: cannot read ${fileName}: ${e}`);
     }
 
-    const argv = [fileName, ...args.slice(1)];
+    // argv[0] = the program name, followed by the provided args.
+    const argv = [fileName, ...args];
     const envp = options.env ?? [
       "HOME=/root",
       "USER=user",
@@ -248,9 +249,16 @@ export class Linux {
   // ── Private helpers ─────────────────────────────────────────────────────────
 
   private async _readFile(path: string): Promise<Uint8Array> {
-    // Check if this path exists as a mounted file (add_file'd).
-    // For now we throw — callers must pre-load ELF bytes.
-    throw new Error(`_readFile: ${path} not found in VFS (pre-load ELF bytes via add_file)`);
+    // Try to read from the VFS (populated via add_file or load_fs_image).
+    if (this.runtime) {
+      const data = this.runtime.read_file(path);
+      if (data && data.length > 0) {
+        return data;
+      }
+    }
+    // Fall back to a network fetch if the path looks like an absolute URL
+    // or starts with '/' and there's a base URL configured.
+    throw new Error(`_readFile: ${path} not found in VFS`);
   }
 
   private _flushOutput(): void {

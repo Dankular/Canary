@@ -153,9 +153,6 @@ pub fn execute(
     macro_rules! write {
         ($op:expr, $val:expr) => { write_op(cpu, mem, $op, sz, $val, next_rip)? }
     }
-    macro_rules! read8 {
-        ($op:expr) => { read_op(cpu, mem, $op, 8, next_rip)? }
-    }
 
     match &instr.mnemonic {
         // ── NOP ───────────────────────────────────────────────────────────
@@ -580,7 +577,7 @@ pub fn execute(
                 64 => (rax as u32) as i32 as i64 as u64,
                 _  => (rax as i64 >> 63) as u64,
             };
-            cpu.write64(reg::RDX, if sign as i64 < 0 { u64::MAX } else { 0 });
+            cpu.write64(reg::RDX, if (sign as i64) < 0 { u64::MAX } else { 0 });
             // Also sign-extend RAX for CWDE/CDQE
             if matches!(instr.mnemonic, Cwde | Cdqe | Cbw) {
                 cpu.write64(reg::RAX, sign);
@@ -636,15 +633,15 @@ pub fn execute(
         // ── String instructions ───────────────────────────────────────────
         Movs => {
             let dir    = if cpu.rflags & DF != 0 { u64::MAX } else { 1 };
-            let src    = cpu.gpr[reg::RSI];
-            let dst    = cpu.gpr[reg::RDI];
+            let _src   = cpu.gpr[reg::RSI];
+            let _dst   = cpu.gpr[reg::RDI];
             let count  = if instr.prefixes.rep != 0 { cpu.gpr[reg::RCX] } else { 1 };
             let stride = (sz / 8) as u64;
             for _ in 0..count {
                 let val = match sz {
-                    8  => mem.read_u8(cpu.gpr[reg::RSI])  as u64,
-                    16 => mem.read_u16(cpu.gpr[reg::RSI]) as u64,
-                    32 => mem.read_u32(cpu.gpr[reg::RSI]) as u64,
+                    8  => mem.read_u8(cpu.gpr[reg::RSI])?  as u64,
+                    16 => mem.read_u16(cpu.gpr[reg::RSI])? as u64,
+                    32 => mem.read_u32(cpu.gpr[reg::RSI])? as u64,
                     _  => mem.read_u64(cpu.gpr[reg::RSI])?,
                 };
                 match sz {
@@ -684,9 +681,9 @@ pub fn execute(
             let mut remaining = count;
             while remaining > 0 {
                 let val = match sz {
-                    8  => mem.read_u8(cpu.gpr[reg::RDI])  as u64,
-                    16 => mem.read_u16(cpu.gpr[reg::RDI]) as u64,
-                    32 => mem.read_u32(cpu.gpr[reg::RDI]) as u64,
+                    8  => mem.read_u8(cpu.gpr[reg::RDI])?  as u64,
+                    16 => mem.read_u16(cpu.gpr[reg::RDI])? as u64,
+                    32 => mem.read_u32(cpu.gpr[reg::RDI])? as u64,
                     _  => mem.read_u64(cpu.gpr[reg::RDI])?,
                 };
                 flags::sub_flags(&mut cpu.rflags, acc, val, 0, sz);

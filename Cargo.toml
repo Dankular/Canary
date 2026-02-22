@@ -16,10 +16,12 @@ authors = ["Canary Contributors"]
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
+canary-memory = { path = "crates/canary-memory" }
 thiserror   = "1"
 log         = "0.4"
 wasm-bindgen = "0.2"
 js-sys      = "0.3"
 web-sys     = { version = "0.3", features = ["console"] }
 serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
 bitflags    = "2"
