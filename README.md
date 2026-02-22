@@ -1,18 +1,18 @@
 # Canary
 
-A from-scratch x86-64 Linux ELF emulator written in Rust, compiled to WebAssembly. Runs unmodified 64-bit Linux binaries directly in the browser — no plugins, no CDN, no native code.
+A from-scratch Linux ELF emulator written in Rust, compiled to WebAssembly. Runs unmodified 64-bit Linux binaries directly in the browser — no plugins, no CDN, no native code. Supports both **x86-64** and **AArch64** ELF binaries.
 
 ### Key differences from CheerpX
 
 | Feature | CheerpX | Canary |
 |---|---|---|
-| Architecture | x86 (32-bit only) | **x86-64 (64-bit)** |
+| Architecture | x86 (32-bit only) | **x86-64 + AArch64 (64-bit)** |
 | ELF support | ET_EXEC 32-bit | **ET_EXEC + ET_DYN (PIE) 64-bit** |
-| Syscall ABI | `INT 0x80` (i386) | **`SYSCALL` instruction (x86-64)** |
-| Registers | 8 GPRs (EAX–EDI) | **16 GPRs (RAX–R15) + XMM0–XMM15** |
+| Syscall ABI | `INT 0x80` (i386) | **`SYSCALL` (x86-64) / `SVC #0` (AArch64)** |
+| Registers | 8 GPRs (EAX–EDI) | **x86-64: 16 GPRs + XMM / AArch64: X0–X30 + SP** |
 | Runtime | Closed-source CDN binary | **Open-source Rust → WASM** |
 | CDN dependency | Required | **None — fully self-hosted** |
-| TLS support | Limited | **FS.base via `arch_prctl`** |
+| TLS support | Limited | **FS.base (x86-64) / TPIDR_EL0 (AArch64)** |
 | Threads | ❌ | **pthreads via SharedArrayBuffer + Web Workers** |
 | Networking | ❌ | **BSD sockets → WebSocket bridge** |
 | Graphical output | ❌ | **/dev/fb0 framebuffer → Canvas** |
@@ -31,42 +31,43 @@ A from-scratch x86-64 Linux ELF emulator written in Rust, compiled to WebAssembl
                              │ wasm-bindgen
 ┌────────────────────────────▼────────────────────────────────────────┐
 │                   canary-wasm  (WASM entry point)                    │
-│  CanaryRuntime { cpu, mem, ctx, jit }                                │
-│  JIT dispatch → interpreter fallback → syscall trap → dispatch       │
-└───┬──────────────┬──────────────┬──────────────────────────────────-┘
-    │              │              │
-┌───▼────┐  ┌─────▼──────┐  ┌───▼──────────┐  ┌────────────────┐
-│canary- │  │ canary-cpu │  │canary-syscall│  │  canary-jit    │
-│  elf   │  │            │  │              │  │                │
-│        │  │ registers  │  │ ~80 syscalls │  │ JitCache       │
-│ELF64   │  │ decoder    │  │ mmap/brk/    │  │ basic-block    │
-│parser  │  │ interpreter│  │ signals/net/ │  │ decode-once/   │
-│auxv    │  │ flags      │  │ threads/fb…  │  │ replay         │
-└────────┘  └────────────┘  └──────┬───────┘  └────────────────┘
-                                    │
-              ┌─────────────────────┼──────────────────────────┐
-              │                     │                          │
-  ┌───────────▼──────┐  ┌──────────▼──────┐  ┌───────────────▼──────┐
-  │  canary-memory   │  │   canary-fs      │  │   canary-net         │
-  │  GuestMemory     │  │ VFS / MemFs      │  │ SocketTable          │
-  │  page-table      │  │ /proc /dev       │  │ 18 BSD socket calls  │
-  │  mmap/munmap/brk │  │ ext2 parser      │  │ WebSocket bridge     │
-  └──────────────────┘  └─────────────────┘  └──────────────────────┘
-              │
-  ┌───────────▼──────────────────────────────┐
-  │  canary-fb              canary-thread     │
-  │  /dev/fb0 framebuffer   ThreadTable       │
-  │  FBIO ioctls            clone/futex       │
-  │  BGRA → Canvas blit     Worker spawn      │
-  └──────────────────────────────────────────┘
+│  CanaryRuntime { cpu (x86-64), arm_cpu (AArch64), mem, ctx, jit }   │
+│  arch detect → JIT/interpreter dispatch → syscall trap → dispatch    │
+└───┬──────────────┬──────────────┬──────────────┬────────────────────┘
+    │              │              │              │
+┌───▼────┐  ┌─────▼──────┐ ┌────▼──────────┐ ┌─▼────────────┐  ┌──────────────┐
+│canary- │  │ canary-cpu │ │canary-cpu-    │ │canary-syscall│  │ canary-jit   │
+│  elf   │  │            │ │  arm64        │ │              │  │              │
+│        │  │ x86-64     │ │               │ │ ~80 syscalls │  │ JitCache     │
+│ELF64   │  │ registers  │ │ ArmCpuState   │ │ mmap/brk/    │  │ basic-block  │
+│parser  │  │ decoder    │ │ A64 decoder   │ │ signals/net/ │  │ decode-once/ │
+│auxv    │  │ interpreter│ │ interpreter   │ │ threads/fb…  │  │ replay       │
+└────────┘  └────────────┘ └───────────────┘ └──────┬───────┘  └──────────────┘
+                                                     │
+                           ┌─────────────────────────┼──────────────────────────┐
+                           │                         │                          │
+               ┌───────────▼──────┐  ┌──────────────▼──┐  ┌───────────────────▼──┐
+               │  canary-memory   │  │   canary-fs      │  │   canary-net         │
+               │  GuestMemory     │  │ VFS / MemFs      │  │ SocketTable          │
+               │  page-table      │  │ /proc /dev       │  │ 18 BSD socket calls  │
+               │  mmap/munmap/brk │  │ ext2 parser      │  │ WebSocket bridge     │
+               └──────────────────┘  └─────────────────┘  └──────────────────────┘
+                           │
+               ┌───────────▼──────────────────────────────┐
+               │  canary-fb              canary-thread     │
+               │  /dev/fb0 framebuffer   ThreadTable       │
+               │  FBIO ioctls            clone/futex       │
+               │  BGRA → Canvas blit     Worker spawn      │
+               └──────────────────────────────────────────┘
 ```
 
 ### Crates
 
 | Crate | Purpose |
 |---|---|
-| `canary-elf` | Parse ELF64 headers, program headers, dynamic section, RELA relocations, auxv/stack construction |
+| `canary-elf` | Parse ELF64 headers, program headers, dynamic section, RELA relocations, auxv/stack construction; supports x86-64 and AArch64 |
 | `canary-cpu` | x86-64 register file (16 GPRs, XMM0–15, x87, RFLAGS), instruction decoder, interpreter |
+| `canary-cpu-arm64` | AArch64 register file (`ArmCpuState`: X0–X30, SP, PC, PSTATE, TPIDR_EL0), full A64 decoder, interpreter |
 | `canary-memory` | 64-bit guest VM backed by a page-table (`HashMap<page_number, frame_index>`); only touched pages consume physical RAM |
 | `canary-fs` | In-memory VFS (MemFs), /proc and /dev pseudo-files, read-only ext2 image parser |
 | `canary-syscall` | Linux x86-64 syscall dispatcher, file descriptor table, signal state, stdout/stderr capture |
@@ -74,7 +75,9 @@ A from-scratch x86-64 Linux ELF emulator written in Rust, compiled to WebAssembl
 | `canary-net` | Virtual socket table, 18 BSD socket syscalls, `PendingConnect`/`PendingSend` queues for JS WebSocket bridge |
 | `canary-fb` | `/dev/fb0` framebuffer emulation (1024×768 BGRA), FBIO ioctls, pixel readback for Canvas blit |
 | `canary-thread` | `ThreadTable`, per-thread `CpuState` + signal mask, `clone`/`futex` support, Web Worker spawn requests |
-| `canary-wasm` | WASM entry point, wasm-bindgen glue, interpreter/JIT loop orchestration |
+| `canary-io` | Guest I/O port emulation (IN/OUT instructions), read/write queues for JS bridging |
+| `canary-input` | `/dev/input/event0` evdev emulation, browser key/mouse → Linux input event translation |
+| `canary-wasm` | WASM entry point, wasm-bindgen glue, interpreter/JIT loop orchestration for both architectures |
 
 ## Quick Start
 
@@ -147,7 +150,7 @@ rt.load_fs_image(ext2Bytes);
 // Or add individual files
 rt.add_file('/myapp', elfBytes);
 
-// Execute an ELF binary
+// Execute an ELF binary (x86-64 or AArch64 — auto-detected from e_machine)
 const argv = JSON.stringify(['/myapp', 'arg1']);
 const envp = JSON.stringify(['HOME=/root', 'TERM=xterm-256color']);
 const exitCode = rt.run_elf(elfBytes, argv, envp);
@@ -180,6 +183,8 @@ rt.free();
 
 ## Implemented Syscalls
 
+### x86-64
+
 `read` `write` `open` `openat` `close` `lseek` `pread64` `readv` `writev`
 `stat` `fstat` `lstat` `fstatat`
 `mmap` `mprotect` `munmap` `mremap` `brk` `madvise`
@@ -203,7 +208,25 @@ rt.free();
 `wait4` `fork`
 `exit` `exit_group`
 
-## Supported x86-64 Instructions
+### AArch64
+
+AArch64 binaries use a different syscall numbering. Canary translates ~50 AArch64 Linux syscall numbers to their x86-64 equivalents and reuses the same dispatch implementation:
+
+`read(63)` `write(64)` `openat(56)` `close(57)` `lseek(62)` `readv(65)` `writev(66)` `pread64(67)` `pwrite64(68)` `fcntl(25)` `ioctl(29)`
+`getcwd(17)` `chdir(49)` `getdents64(61)` `newfstatat(79)` `fstat(80)`
+`mmap(222)` `mprotect(226)` `munmap(215)` `brk(214)` `mremap(216)`
+`exit(93)` `exit_group(94)` `getpid(172)` `gettid(178)` `getuid(174)` `geteuid(175)` `getgid(176)` `getegid(177)`
+`set_tid_address(96)` `futex(98)` `clone(220)` `execve(221)` `wait4(260)`
+`rt_sigaction(134)` `rt_sigprocmask(135)`
+`socket(198)` `bind(200)` `connect(203)` `listen(201)` `accept(202)` `sendto(206)` `recvfrom(207)` `setsockopt(208)` `getsockopt(209)` `getsockname(204)` `getpeername(205)`
+`clock_gettime(113)` `nanosleep(116)`
+`uname(160)`
+
+Thread pointer (`TPIDR_EL0`) is read and written via `MRS`/`MSR` instructions handled directly in the interpreter.
+
+## Supported Instructions
+
+### x86-64
 
 | Family | Instructions |
 |--------|-------------|
@@ -221,6 +244,21 @@ rt.free();
 | x87 FPU | FLD, FSTP, FADDP, FSUBP, FMULP, FDIVP, FCOMPP |
 | String ops | SCAS, CMPS, STOS, LODS (with REP) |
 | Misc | NOP, HLT, CPUID, RDTSC, XGETBV, PUSHF/POPF, LAHF/SAHF |
+
+### AArch64 (A64)
+
+| Family | Instructions |
+|--------|-------------|
+| Data movement | MOV (reg/imm), MOVZ, MOVN, MOVK, LDR/STR (imm/reg/literal), LDRB/STRB, LDRH/STRH, LDRSB/LDRSH/LDRSW, LDP/STP (signed/pre/post), LDUR/STUR |
+| Arithmetic | ADD/ADDS, SUB/SUBS (immediate and shifted reg), MUL (via MADD), UDIV, SDIV |
+| Logical | AND/ANDS, ORR, EOR (immediate and shifted reg), BIC, ORN, EON |
+| Shifts | LSL, LSR, ASR (register and immediate via UBFM/SBFM) |
+| Bitfield | SXTB, SXTH, SXTW, UXTB/UXTH/UXTW, RBIT, CLZ, REV |
+| Control flow | B, BL, BR, BLR, RET, B.cond (all 16), CBZ, CBNZ, TBZ, TBNZ |
+| PC-relative | ADR, ADRP |
+| Conditionals | CSEL, CSINC, CSINV, CSNEG |
+| Atomics | LDXR, STXR (no-reservation simplified) |
+| System | SVC, MRS/MSR (TPIDR_EL0), DMB, DSB, ISB, NOP |
 
 ## Memory Layout
 
@@ -243,7 +281,9 @@ Canary implements a **Tier-0 soft JIT** (decode-once basic-block cache) in `cana
 3. The cache holds up to 8,192 blocks; on overflow an arbitrary entry is evicted in O(1).
 4. `invalidate_range(guest_start, length)` removes all cached blocks whose entry RIP falls in the invalidated range. This is called from `mprotect(PROT_NONE)` and from any self-modifying-code write path to prevent stale decoded blocks from being re-used.
 
-A **Tier-1 JIT** (genuine WASM bytecode emission per basic block) can replace `execute_block` without changing the public API — the `JitCache` interface is designed for this upgrade path.
+A **Tier-1 JIT** (genuine WASM bytecode emission per basic block) can replace `execute_block` without changing the public API — the `JitCache` interface is designed for this upgrade path. The `canary-jit` crate already contains a `emitter.rs` stub using `wasm-encoder`.
+
+The JIT currently only covers x86-64. AArch64 runs through the pure interpreter.
 
 ## Threads
 
@@ -300,12 +340,15 @@ Canary includes a **read-only ext2 parser** (`canary-fs/src/ext2.rs`) that popul
 - [x] Networking (BSD sockets → WebSocket bridge)
 - [x] Graphical output (`/dev/fb0` → Canvas)
 - [x] WASM64 (page-table memory, full 64-bit VA)
-- [ ] JIT Tier-1: emit WASM bytecode per basic block
+- [x] **AArch64 ELF support** — full A64 decoder + interpreter + syscall translation shim; auto-detected from `e_machine`
+- [x] `/dev/input/event0` evdev (keyboard + mouse → Linux input events)
+- [x] I/O port emulation (IN/OUT instructions, JS bridge)
+- [ ] JIT Tier-1: emit real WASM bytecode per basic block (wasm-encoder stub in `canary-jit/src/emitter.rs`)
+- [ ] AArch64 JIT: basic-block cache for A64 (currently interpreter-only)
 - [ ] Threads Tier-2: true SharedArrayBuffer memory sharing between Workers
-- [ ] Networking: TCP-over-WebSocket proxy for real TCP connections
-- [ ] X11/Wayland protocol emulation
-- [ ] ARM64 ELF support
-- [ ] `/dev/input/event0` evdev for keyboard/mouse
+- [ ] Networking: TCP-over-WebSocket proxy for real TCP connections (`harness/tcp-proxy.mjs`)
+- [ ] Dynamic linker for AArch64 (`ld-linux-aarch64.so.1`)
+- [ ] X11/Wayland protocol emulation over Unix socket
 
 ## License
 
