@@ -165,6 +165,9 @@ pub enum Mnemonic {
     Cbw, Cwde, Cdqe, Cwd, Cdq, Cqo,
     // Conditonal move helpers
     SysEnter, SysExit,
+    // I/O port instructions
+    In,   // IN AL/AX/EAX, DX
+    Out,  // OUT DX, AL/AX/EAX
     // Unrecognised (will fault)
     Unknown(u8),
 }
@@ -659,6 +662,22 @@ fn decode_opcode(
         0x0F => {
             let opcode2 = r.read()?;
             decode_2byte(r, opcode2, pfx, op_size, rip_approx)?
+        }
+
+        // ── IN / OUT (port I/O) ───────────────────────────────────────────
+        // 0xEC: IN AL, DX   (byte)
+        // 0xED: IN AX, DX (word, if 0x66 prefix) or IN EAX, DX (dword)
+        // 0xEE: OUT DX, AL  (byte)
+        // 0xEF: OUT DX, AX (word, if 0x66 prefix) or OUT DX, EAX (dword)
+        0xEC => (Mnemonic::In,  8,  vec![]),
+        0xED => {
+            let sz = if pfx.osz { 16 } else { 32 };
+            (Mnemonic::In, sz, vec![])
+        }
+        0xEE => (Mnemonic::Out, 8,  vec![]),
+        0xEF => {
+            let sz = if pfx.osz { 16 } else { 32 };
+            (Mnemonic::Out, sz, vec![])
         }
 
         // ── LEA relative to CS (far ops, rare) ───────────────────────────

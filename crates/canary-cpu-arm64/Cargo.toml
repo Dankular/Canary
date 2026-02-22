@@ -1,0 +1,10 @@
+[package]
+name = "canary-cpu-arm64"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+log.workspace = true
+canary-memory = { path = "../canary-memory" }
+canary-syscall = { path = "../canary-syscall" }

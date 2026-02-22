@@ -25,6 +25,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "canary-cpu-arm64"
+version = "0.1.0"
+dependencies = [
+ "canary-memory",
+ "canary-syscall",
+ "log",
+ "thiserror",
+]
+
+[[package]]
 name = "canary-elf"
 version = "0.1.0"
 dependencies = [
@@ -52,6 +62,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "canary-input"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "canary-io"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "canary-jit"
 version = "0.1.0"
 dependencies = [
@@ -59,6 +83,7 @@ dependencies = [
  "canary-memory",
  "log",
  "thiserror",
+ "wasm-encoder",
 ]
 
 [[package]]
@@ -84,6 +109,8 @@ version = "0.1.0"
 dependencies = [
  "canary-fb",
  "canary-fs",
+ "canary-input",
+ "canary-io",
  "canary-memory",
  "canary-net",
  "canary-thread",
@@ -104,9 +131,12 @@ name = "canary-wasm"
 version = "0.1.0"
 dependencies = [
  "canary-cpu",
+ "canary-cpu-arm64",
  "canary-elf",
  "canary-fb",
  "canary-fs",
+ "canary-input",
+ "canary-io",
  "canary-jit",
  "canary-memory",
  "canary-net",
@@ -128,6 +158,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
+name = "equivalent"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
+
+[[package]]
+name = "hashbrown"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
+
+[[package]]
+name = "indexmap"
+version = "2.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7714e70437a7dc3ac8eb7e6f8df75fd8eb422675fc7678aff7364301092b1017"
+dependencies = [
+ "equivalent",
+ "hashbrown",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -142,6 +194,12 @@ dependencies = [
  "once_cell",
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "leb128fmt"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
 name = "log"
@@ -184,6 +242,12 @@ name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
+
+[[package]]
+name = "semver"
+version = "1.0.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d767eb0aabc880b29956c35734170f26ed551a859dbd361d140cdbeca61ab1e2"
 
 [[package]]
 name = "serde"
@@ -308,6 +372,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "60eecd4fe26177cfa3339eb00b4a36445889ba3ad37080c2429879718e20ca41"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "wasm-encoder"
+version = "0.245.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f9dca005e69bf015e45577e415b9af8c67e8ee3c0e38b5b0add5aa92581ed5c"
+dependencies = [
+ "leb128fmt",
+ "wasmparser",
+]
+
+[[package]]
+name = "wasmparser"
+version = "0.245.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f08c9adee0428b7bddf3890fc27e015ac4b761cc608c822667102b8bfd6995e"
+dependencies = [
+ "bitflags",
+ "indexmap",
+ "semver",
 ]
 
 [[package]]

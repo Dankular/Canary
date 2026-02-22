@@ -51,6 +51,8 @@ pub struct FdTable {
     next_fd: u64,
     /// Set of fds that map to the /dev/fb0 framebuffer device.
     fb_fds: HashSet<u64>,
+    /// Set of fds that map to /dev/input/event* devices.
+    input_fds: HashSet<u64>,
 }
 
 struct OpenFd {
@@ -61,7 +63,12 @@ struct OpenFd {
 
 impl FdTable {
     pub fn new() -> Self {
-        let mut t = FdTable { fds: HashMap::new(), next_fd: 3, fb_fds: HashSet::new() };
+        let mut t = FdTable {
+            fds: HashMap::new(),
+            next_fd: 3,
+            fb_fds: HashSet::new(),
+            input_fds: HashSet::new(),
+        };
         // stdin=0, stdout=1, stderr=2 are pre-opened.
         for fd in 0..3u64 {
             t.fds.insert(fd, OpenFd { ino: 0, offset: 0, flags: 0 });
@@ -82,14 +89,27 @@ impl FdTable {
         self.fb_fds.insert(fd);
         fd
     }
+    /// Allocate an input device fd (backed by a sentinel inode 0).
+    pub fn alloc_input(&mut self) -> u64 {
+        let fd = self.next_fd;
+        self.next_fd += 1;
+        self.fds.insert(fd, OpenFd { ino: 0, offset: 0, flags: 0 });
+        self.input_fds.insert(fd);
+        fd
+    }
     /// Returns true if `fd` refers to the /dev/fb0 framebuffer.
     pub fn is_framebuffer(&self, fd: u64) -> bool {
         self.fb_fds.contains(&fd)
+    }
+    /// Returns true if `fd` refers to a /dev/input/event* device.
+    pub fn is_input(&self, fd: u64) -> bool {
+        self.input_fds.contains(&fd)
     }
     fn get(&self, fd: u64) -> Option<&OpenFd> { self.fds.get(&fd) }
     fn get_mut(&mut self, fd: u64) -> Option<&mut OpenFd> { self.fds.get_mut(&fd) }
     fn close(&mut self, fd: u64) -> bool {
         self.fb_fds.remove(&fd);
+        self.input_fds.remove(&fd);
         self.fds.remove(&fd).is_some()
     }
 }
@@ -122,6 +142,12 @@ pub struct SyscallCtx {
     // ── Networking ────────────────────────────────────────────────────────
     /// Virtual socket table and JS bridge queues.
     pub net: canary_net::NetCtx,
+    // ── I/O ports ─────────────────────────────────────────────────────────
+    /// I/O port emulation (IN/OUT instructions, WebX GPU bridge).
+    pub io: canary_io::IoCtx,
+    // ── Input devices ─────────────────────────────────────────────────────
+    /// Linux evdev input emulation for /dev/input/event0.
+    pub input: canary_input::InputCtx,
 }
 
 impl SyscallCtx {
@@ -156,6 +182,8 @@ impl SyscallCtx {
             current_tid:   1,
             pending_clone: Vec::new(),
             net:           canary_net::NetCtx::new(),
+            io:            canary_io::IoCtx::new(),
+            input:         canary_input::InputCtx::new(),
         }
     }
 }
@@ -195,6 +223,15 @@ pub fn handle_syscall(
             let fd    = a0;
             let buf   = a1;
             let count = a2 as usize;
+            // Intercept reads from /dev/input/event* fds.
+            if ctx.fds.is_input(fd) {
+                let data = ctx.input.read_events(count);
+                if data.is_empty() {
+                    return Ok(-EAGAIN);  // non-blocking: no events pending
+                }
+                mem.write_bytes_at(buf, &data)?;
+                return Ok(data.len() as i64);
+            }
             match fd {
                 0 => {
                     // stdin: return EOF for now.
@@ -252,6 +289,10 @@ pub fn handle_syscall(
             if abs == "/dev/fb0" {
                 return Ok(ctx.fds.alloc_fb() as i64);
             }
+            // Intercept /dev/input/event* — return an input fd.
+            if abs.starts_with("/dev/input/event") || abs == "/dev/input/mice" {
+                return Ok(ctx.fds.alloc_input() as i64);
+            }
             match ctx.vfs.mem.lookup(&abs) {
                 Ok(ino) => {
                     let fd = ctx.fds.alloc(ino, flags);
@@ -284,6 +325,10 @@ pub fn handle_syscall(
             // Intercept /dev/fb0 — return a framebuffer fd.
             if abs == "/dev/fb0" {
                 return Ok(ctx.fds.alloc_fb() as i64);
+            }
+            // Intercept /dev/input/event* — return an input fd.
+            if abs.starts_with("/dev/input/event") || abs == "/dev/input/mice" {
+                return Ok(ctx.fds.alloc_input() as i64);
             }
             match ctx.vfs.mem.lookup(&abs) {
                 Ok(ino) => {
@@ -572,7 +617,7 @@ pub fn handle_syscall(
             0
         }
 
-        // ── ioctl (terminal size, tty, framebuffer) ───────────────────────
+        // ── ioctl (terminal size, tty, framebuffer, evdev) ───────────────
         SYS_IOCTL => {
             let ioctl_fd  = a0;
             let ioctl_cmd = a1;
@@ -581,17 +626,78 @@ pub fn handle_syscall(
             if ctx.fds.is_framebuffer(ioctl_fd) {
                 return Ok(ctx.fb.ioctl(ioctl_cmd, ioctl_arg, mem));
             }
-            match ioctl_cmd {
-                TIOCGWINSZ => {
-                    // struct winsize: ws_row, ws_col, ws_xpixel, ws_ypixel (u16 each)
-                    mem.write_u16(ioctl_arg,      24)?;  // rows
-                    mem.write_u16(ioctl_arg + 2,  80)?;  // cols
-                    mem.write_u16(ioctl_arg + 4,   0)?;
-                    mem.write_u16(ioctl_arg + 6,   0)?;
-                    0
+            // Handle evdev ioctls for /dev/input/event* fds.
+            if ctx.fds.is_input(ioctl_fd) {
+                // EVIOCGVERSION _IOC(_IOC_READ,'E',0x01,sizeof(int)) = 0x80044501
+                const EVIOCGVERSION: u64 = 0x80044501;
+                // EVIOCGID       _IOC(_IOC_READ,'E',0x02,sizeof(struct input_id)) = 0x80084502
+                const EVIOCGID:      u64 = 0x80084502;
+                // EVIOCGNAME(len) _IOC(_IOC_READ,'E',0x06,len)
+                const EVIOCGNAME_BASE: u64 = 0x80004506;
+                // EVIOCGBIT(EV_KEY, len) _IOC(_IOC_READ,'E',0x20+type,len)
+                const EVIOCGBIT_KEY_BASE: u64 = 0x80004520;
+                // EVIOCGBIT(EV_REL, len)
+                const EVIOCGBIT_REL_BASE: u64 = 0x80004522;
+
+                match ioctl_cmd {
+                    EVIOCGVERSION => {
+                        // Write driver version 1.0.1 as u32 LE.
+                        mem.write_u32(ioctl_arg, 0x00010001).ok();
+                        0
+                    }
+                    EVIOCGID => {
+                        // struct input_id: bustype(u16), vendor(u16), product(u16), version(u16)
+                        mem.write_u16(ioctl_arg,     0).ok(); // BUS_VIRTUAL
+                        mem.write_u16(ioctl_arg + 2, 0).ok();
+                        mem.write_u16(ioctl_arg + 4, 0).ok();
+                        mem.write_u16(ioctl_arg + 6, 0).ok();
+                        0
+                    }
+                    cmd if (cmd & 0xFFFF_FF00) == (EVIOCGNAME_BASE & 0xFFFF_FF00) => {
+                        // EVIOCGNAME: write device name string.
+                        let name = b"Canary Virtual Input\0";
+                        // The upper 14 bits encode max length.
+                        let max_len = ((cmd >> 16) & 0x3FFF) as usize;
+                        let n = name.len().min(max_len);
+                        if ioctl_arg != 0 {
+                            mem.write_bytes_at(ioctl_arg, &name[..n]).ok();
+                        }
+                        n as i64
+                    }
+                    cmd if (cmd & 0xFFFF_00FF) == (EVIOCGBIT_KEY_BASE & 0xFFFF_00FF)
+                        && ((cmd >> 8) & 0xFF) == 0x20 =>
+                    {
+                        // EVIOCGBIT(EV_KEY): write key bitmap — all zeros (no caps report).
+                        let max_len = ((cmd >> 16) & 0x3FFF) as usize;
+                        for i in 0..max_len.min(96) {
+                            mem.write_u8(ioctl_arg + i as u64, 0).ok();
+                        }
+                        0
+                    }
+                    cmd if (cmd & 0xFFFF_00FF) == (EVIOCGBIT_REL_BASE & 0xFFFF_00FF)
+                        && ((cmd >> 8) & 0xFF) == 0x22 =>
+                    {
+                        // EVIOCGBIT(EV_REL): report REL_X (bit0) and REL_Y (bit1) supported.
+                        if ioctl_arg != 0 {
+                            mem.write_u8(ioctl_arg, 0x03).ok(); // bits 0 and 1 set
+                        }
+                        0
+                    }
+                    _ => 0, // ignore unknown evdev ioctls
                 }
-                TCGETS | TCSETS => 0,
-                _ => -EINVAL,
+            } else {
+                match ioctl_cmd {
+                    TIOCGWINSZ => {
+                        // struct winsize: ws_row, ws_col, ws_xpixel, ws_ypixel (u16 each)
+                        mem.write_u16(ioctl_arg,      24)?;  // rows
+                        mem.write_u16(ioctl_arg + 2,  80)?;  // cols
+                        mem.write_u16(ioctl_arg + 4,   0)?;
+                        mem.write_u16(ioctl_arg + 6,   0)?;
+                        0
+                    }
+                    TCGETS | TCSETS => 0,
+                    _ => -EINVAL,
+                }
             }
         }
 

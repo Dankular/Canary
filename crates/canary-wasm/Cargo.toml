@@ -19,6 +19,7 @@ serde.workspace = true
 serde_json.workspace = true
 canary-elf      = { path = "../canary-elf" }
 canary-cpu      = { path = "../canary-cpu" }
+canary-cpu-arm64 = { path = "../canary-cpu-arm64" }
 canary-memory   = { path = "../canary-memory" }
 canary-syscall  = { path = "../canary-syscall" }
 canary-fs       = { path = "../canary-fs" }
@@ -26,4 +27,6 @@ canary-fb       = { path = "../canary-fb" }
 canary-thread   = { path = "../canary-thread" }
 canary-jit      = { path = "../canary-jit" }
 canary-net      = { path = "../canary-net" }
+canary-input    = { path = "../canary-input" }
+canary-io       = { path = "../canary-io" }
 

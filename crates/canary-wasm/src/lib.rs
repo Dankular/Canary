@@ -1,9 +1,12 @@
 //! Canary WASM entry point — exposed to JavaScript via wasm-bindgen.
 
 use wasm_bindgen::prelude::*;
-use canary_elf::{Elf64, ElfError};
+use canary_elf::{Elf64, ElfError, EM_AARCH64};
 use canary_memory::{GuestMemory, layout, Prot, MapFlags};
 use canary_cpu::{CpuState, decoder::decode, interpreter::{execute, ExecError}};
+use canary_cpu_arm64::{ArmCpuState,
+    decoder::decode as arm_decode,
+    interpreter::{execute as arm_execute, ArmExecError}};
 use canary_syscall::dispatch::{SyscallCtx, handle_syscall};
 use canary_elf::auxv::{build_auxv, build_initial_stack};
 use canary_jit::{JitCache, JitResult};
@@ -26,10 +29,11 @@ extern "C" {
 
 #[wasm_bindgen]
 pub struct CanaryRuntime {
-    cpu:  CpuState,
-    mem:  GuestMemory,
-    ctx:  SyscallCtx,
-    jit:  JitCache,
+    cpu:     CpuState,
+    arm_cpu: Option<ArmCpuState>,
+    mem:     GuestMemory,
+    ctx:     SyscallCtx,
+    jit:     JitCache,
 }
 
 #[wasm_bindgen]
@@ -39,10 +43,11 @@ impl CanaryRuntime {
     pub fn new() -> Self {
         console_error_panic_hook_init();
         CanaryRuntime {
-            cpu: CpuState::default(),
-            mem: GuestMemory::new(layout::TOTAL_WASM_BYTES),
-            ctx: SyscallCtx::new(),
-            jit: JitCache::new(),
+            cpu:     CpuState::default(),
+            arm_cpu: None,
+            mem:     GuestMemory::new(layout::TOTAL_WASM_BYTES),
+            ctx:     SyscallCtx::new(),
+            jit:     JitCache::new(),
         }
     }
 
@@ -179,9 +184,11 @@ impl CanaryRuntime {
         self.ctx.cwd = path.to_string();
     }
 
-    /// Return current RIP value (for debugging).
+    /// Return current program counter (RIP on x86-64, PC on AArch64).
     #[wasm_bindgen]
-    pub fn rip(&self) -> u64 { self.cpu.rip }
+    pub fn rip(&self) -> u64 {
+        if let Some(ref a) = self.arm_cpu { a.pc } else { self.cpu.rip }
+    }
 
     /// Return a JSON object with all GPR values (for debugging).
     #[wasm_bindgen]
@@ -475,17 +482,31 @@ impl CanaryRuntime {
     /// Set up memory, CPU, and stack for an ELF binary without executing it.
     /// Shared setup between prepare_elf() and run_elf().
     fn prepare_elf_inner(&mut self, data: &[u8], argv: &[String], envp: &[String]) -> Result<(), CanaryError> {
-        // ── 1. Parse main ELF ─────────────────────────────────────────────
-        let elf = Elf64::parse(data, layout::ELF_BASE)?;
+        // ── 1. Peek at e_machine ──────────────────────────────────────────
+        let e_machine = if data.len() >= 20 {
+            u16::from_le_bytes([data[18], data[19]])
+        } else {
+            62 // default x86-64
+        };
+        let is_aarch64 = e_machine == EM_AARCH64;
+
+        // ── 2. Parse main ELF ─────────────────────────────────────────────
+        let elf = if is_aarch64 {
+            Elf64::parse_aarch64(data, layout::ELF_BASE)?
+        } else {
+            Elf64::parse(data, layout::ELF_BASE)?
+        };
         log(&format!(
-            "Canary: loading ELF @ base={:#x} entry={:#x} ({} PT_LOAD segs) interp={:?}",
+            "Canary: loading ELF ({}) @ base={:#x} entry={:#x} ({} PT_LOAD segs) interp={:?}",
+            if is_aarch64 { "aarch64" } else { "x86-64" },
             elf.load_base, elf.entry, elf.load_segs.len(), elf.interp
         ));
 
-        // ── 2. Reset memory state for a fresh execution ───────────────────
-        self.mem  = GuestMemory::new(layout::TOTAL_WASM_BYTES);
-        self.cpu  = CpuState::default();
-        self.jit  = JitCache::new();
+        // ── 3. Reset memory / CPU state for a fresh execution ─────────────
+        self.mem     = GuestMemory::new(layout::TOTAL_WASM_BYTES);
+        self.cpu     = CpuState::default();
+        self.arm_cpu = None;
+        self.jit     = JitCache::new();
         self.ctx.fds     = canary_syscall::dispatch::FdTable::new();
         self.ctx.cwd     = "/".to_string();
         self.ctx.stdout_buf.clear();
@@ -495,12 +516,12 @@ impl CanaryRuntime {
         self.ctx.current_tid   = 1;
         self.ctx.pending_clone = Vec::new();
 
-        // ── 3. Map + load PT_LOAD segments for main ELF ───────────────────
+        // ── 4. Map + load PT_LOAD segments for main ELF ───────────────────
         self.load_elf_segments(data, &elf)?;
 
-        // ── 4. Optionally load the dynamic interpreter ─────────────────────
+        // ── 5. Optionally load the dynamic interpreter ─────────────────────
         let (interp_base, interp_entry) = if let Some(ref interp_path) = elf.interp {
-            match self.load_interpreter(interp_path) {
+            match self.load_interpreter(interp_path, is_aarch64) {
                 Ok((base, entry)) => {
                     log(&format!("Canary: interpreter loaded @ base={:#x} entry={:#x}", base, entry));
                     (base, entry)
@@ -515,16 +536,16 @@ impl CanaryRuntime {
             (0, elf.entry)
         };
 
-        let start_rip = if interp_base != 0 { interp_entry } else { elf.entry };
+        let start_pc = if interp_base != 0 { interp_entry } else { elf.entry };
 
-        // ── 5. Map stack ──────────────────────────────────────────────────
+        // ── 6. Map stack ──────────────────────────────────────────────────
         let stack_base = layout::STACK_TOP - layout::STACK_SIZE;
         self.mem.mmap(stack_base, layout::STACK_SIZE,
                       Prot::READ | Prot::WRITE,
                       MapFlags::FIXED | MapFlags::PRIVATE | MapFlags::ANONYMOUS)
             .map_err(|e| CanaryError::Exec(e.to_string()))?;
 
-        // ── 6. Build auxv + initial stack ─────────────────────────────────
+        // ── 7. Build auxv + initial stack ─────────────────────────────────
         let phdr_addr  = elf.load_base + elf.header.e_phoff;
         let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
         let envp_refs: Vec<&str> = envp.iter().map(|s| s.as_str()).collect();
@@ -540,11 +561,18 @@ impl CanaryRuntime {
         let stack = build_initial_stack(layout::STACK_TOP, &argv_refs, &envp_refs, &auxv, [0u8; 16]);
         self.mem.loader_write(stack.rsp, &stack.data);
 
-        // ── 7. Position CPU at entry point (ready for step()) ─────────────
-        self.cpu.rip = start_rip;
-        self.cpu.gpr[canary_cpu::registers::reg::RSP] = stack.rsp;
+        // ── 8. Position CPU at entry point (ready for step()) ─────────────
+        if is_aarch64 {
+            let mut acpu = ArmCpuState::default();
+            acpu.pc = start_pc;
+            acpu.sp = stack.rsp;
+            self.arm_cpu = Some(acpu);
+        } else {
+            self.cpu.rip = start_pc;
+            self.cpu.gpr[canary_cpu::registers::reg::RSP] = stack.rsp;
+        }
 
-        log(&format!("Canary: ELF prepared, entry={:#x} — call step() to execute", self.cpu.rip));
+        log(&format!("Canary: ELF prepared, entry={:#x} — call step() to execute", start_pc));
         Ok(())
     }
 
@@ -552,7 +580,8 @@ impl CanaryRuntime {
         // Set up ELF (parse, load, stack, CPU) then immediately run to completion.
         self.prepare_elf_inner(data, argv, envp)?;
 
-        log(&format!("Canary: executing from {:#x}", self.cpu.rip));
+        let start_pc = self.arm_cpu.as_ref().map(|a| a.pc).unwrap_or(self.cpu.rip);
+        log(&format!("Canary: executing from {:#x}", start_pc));
         loop {
             match self.step_once() {
                 Ok(()) => {}
@@ -581,9 +610,9 @@ impl CanaryRuntime {
         Ok(())
     }
 
-    /// Load the dynamic interpreter (ld-linux-x86-64.so.2) from VFS.
+    /// Load the dynamic interpreter from VFS.
     /// Returns `(load_base, entry_point)`.
-    fn load_interpreter(&mut self, interp_path: &str) -> Result<(u64, u64), CanaryError> {
+    fn load_interpreter(&mut self, interp_path: &str, is_aarch64: bool) -> Result<(u64, u64), CanaryError> {
         // Look up the interpreter in the VFS (two-step to avoid borrow conflicts).
         let ino = self.ctx.vfs.mem.lookup(interp_path)
             .map_err(|_| CanaryError::Exec(format!("interpreter not found: {interp_path}")))?;
@@ -597,8 +626,11 @@ impl CanaryRuntime {
         };
 
         // Parse the interpreter ELF (always a PIE/ET_DYN); load at INTERP_BASE.
-        let interp_elf = Elf64::parse(&interp_data, layout::INTERP_BASE)
-            .map_err(|e| CanaryError::Exec(format!("interpreter parse error: {e}")))?;
+        let interp_elf = if is_aarch64 {
+            Elf64::parse_aarch64(&interp_data, layout::INTERP_BASE)
+        } else {
+            Elf64::parse(&interp_data, layout::INTERP_BASE)
+        }.map_err(|e| CanaryError::Exec(format!("interpreter parse error: {e}")))?;
 
         log(&format!(
             "Canary: interpreter ELF: base={:#x} entry={:#x} segs={}",
@@ -611,6 +643,11 @@ impl CanaryRuntime {
     }
 
     fn step_once(&mut self) -> Result<(), CanaryError> {
+        // Dispatch to the ARM64 interpreter when running an AArch64 binary.
+        if self.arm_cpu.is_some() {
+            return self.interpret_one_arm64();
+        }
+
         // Check for deliverable signals before executing the next instruction.
         self.deliver_pending_signals()?;
 
@@ -697,6 +734,96 @@ impl CanaryRuntime {
             }
             Err(ExecError::IoPort { .. }) => Ok(()), // unexpected dir value — ignore
             Err(e) => Err(CanaryError::Exec(e.to_string())),
+        }
+    }
+
+    /// Execute one AArch64 instruction (pure interpreter, no JIT).
+    fn interpret_one_arm64(&mut self) -> Result<(), CanaryError> {
+        let acpu = self.arm_cpu.as_mut().unwrap();
+        let pc   = acpu.pc;
+
+        // Fetch 4 bytes (ARM64 instructions are always 4 bytes, fixed-width).
+        let bytes = self.mem.read_bytes(pc, 4)
+            .map(|s| s.to_vec())
+            .or_else(|_| self.mem.read_bytes_copy(pc, 4))
+            .map_err(|e| CanaryError::Exec(format!("arm64 fetch @{pc:#x}: {e}")))?;
+
+        let instr = arm_decode(&bytes, pc)
+            .map_err(|e| CanaryError::Exec(format!("arm64 decode @{pc:#x}: {e}")))?;
+
+        match arm_execute(&instr, acpu, &mut self.mem) {
+            Ok(())                            => Ok(()),
+            Err(ArmExecError::Syscall)        => self.dispatch_syscall_arm64(),
+            Err(ArmExecError::Halt)           => Err(CanaryError::Exit(0)),
+            Err(ArmExecError::MemFault(addr)) =>
+                Err(CanaryError::Exec(format!("arm64 mem fault @{addr:#x} (pc={pc:#x})"))),
+            Err(ArmExecError::IllegalInstruction) => {
+                let raw = u32::from_le_bytes(bytes[..4].try_into().unwrap_or_default());
+                Err(CanaryError::Exec(format!("arm64 illegal instruction {raw:#010x} @{pc:#x}")))
+            }
+        }
+    }
+
+    /// Handle an AArch64 `SVC #0` syscall.
+    /// Translates AArch64 Linux syscall numbers to x86-64 and dispatches.
+    fn dispatch_syscall_arm64(&mut self) -> Result<(), CanaryError> {
+        let acpu = self.arm_cpu.as_mut().unwrap();
+        // AArch64 Linux ABI: syscall nr in X8, args in X0..X5, result in X0.
+        let arm_nr = acpu.x[8];
+        let a0 = acpu.x[0];
+        let a1 = acpu.x[1];
+        let a2 = acpu.x[2];
+        let a3 = acpu.x[3];
+        let a4 = acpu.x[4];
+        let a5 = acpu.x[5];
+
+        // Translate AArch64 syscall number to the x86-64 number used by
+        // canary-syscall's dispatch table.
+        let nr = arm64_to_x86_syscall(arm_nr);
+
+        if nr == u64::MAX {
+            // Untranslated — return ENOSYS.
+            acpu.x[0] = (-38i64) as u64;
+            return Ok(());
+        }
+
+        // rt_sigreturn is not supported on ARM64 yet — return ENOSYS.
+        if nr == canary_syscall::numbers::SYS_RT_SIGRETURN {
+            acpu.x[0] = (-38i64) as u64;
+            return Ok(());
+        }
+
+        let mut fs_base = acpu.tpidr_el0;
+        let mut gs_base = 0u64;
+
+        match handle_syscall(nr, a0, a1, a2, a3, a4, a5,
+                             &mut self.mem, &mut self.ctx,
+                             &mut fs_base, &mut gs_base) {
+            Ok(ret) => {
+                self.arm_cpu.as_mut().unwrap().tpidr_el0 = fs_base;
+                self.arm_cpu.as_mut().unwrap().x[0] = ret as u64;
+                Ok(())
+            }
+            Err(canary_syscall::SyscallError::Exit(code)) => {
+                Err(CanaryError::Exit(code))
+            }
+            Err(canary_syscall::SyscallError::ExecveRequest { path, argv, envp }) => {
+                self.do_execve(&path, &argv, &envp)
+            }
+            Err(canary_syscall::SyscallError::CloneRequest { new_tid, .. }) => {
+                self.arm_cpu.as_mut().unwrap().x[0] = new_tid as u64;
+                Ok(())
+            }
+            Err(canary_syscall::SyscallError::Fault(addr)) => {
+                warn(&format!("arm64 syscall {arm_nr}: fault at {addr:#x}"));
+                self.arm_cpu.as_mut().unwrap().x[0] = (-14i64) as u64; // EFAULT
+                Ok(())
+            }
+            Err(e) => {
+                warn(&format!("arm64 syscall {arm_nr} (x86={nr}): {e}"));
+                self.arm_cpu.as_mut().unwrap().x[0] = (-38i64) as u64; // ENOSYS
+                Ok(())
+            }
         }
     }
 
@@ -976,6 +1103,86 @@ impl CanaryRuntime {
 // ── panic hook ────────────────────────────────────────────────────────────────
 
 fn console_error_panic_hook_init() {}
+
+// ── AArch64 → x86-64 syscall number translation ───────────────────────────────
+//
+// AArch64 Linux uses a "unified" syscall table (different from x86-64).
+// We map the common ones to their x86-64 equivalents so we can reuse the
+// existing canary-syscall dispatch implementation.
+// Returns u64::MAX for unmapped syscalls (caller returns ENOSYS).
+
+fn arm64_to_x86_syscall(arm_nr: u64) -> u64 {
+    match arm_nr {
+        // ── File I/O ─────────────────────────────────────────────────────
+        63  => 0,    // read
+        64  => 1,    // write
+        57  => 3,    // close
+        62  => 8,    // lseek
+        65  => 19,   // readv
+        66  => 20,   // writev
+        67  => 17,   // pread64
+        68  => 18,   // pwrite64
+        23  => 72,   // fcntl  (arm64 fcntl=25? actually arm64 fcntl=25)
+        25  => 72,   // fcntl
+        29  => 16,   // ioctl
+        // ── File system ───────────────────────────────────────────────────
+        56  => 257,  // openat
+        17  => 79,   // getcwd
+        49  => 80,   // chdir
+        61  => 217,  // getdents64
+        79  => 262,  // newfstatat
+        80  => 5,    // fstat
+        // ── Memory management ─────────────────────────────────────────────
+        222 => 9,    // mmap
+        226 => 10,   // mprotect
+        215 => 11,   // munmap
+        214 => 12,   // brk
+        216 => 25,   // mremap
+        // ── Process / thread ──────────────────────────────────────────────
+        93  => 60,   // exit
+        94  => 231,  // exit_group
+        172 => 39,   // getpid
+        178 => 186,  // gettid
+        174 => 102,  // getuid
+        175 => 107,  // geteuid
+        176 => 104,  // getgid
+        177 => 108,  // getegid
+        96  => 218,  // set_tid_address
+        98  => 202,  // futex
+        220 => 56,   // clone
+        221 => 59,   // execve
+        260 => 61,   // wait4
+        // ── Signals ───────────────────────────────────────────────────────
+        134 => 13,   // rt_sigaction
+        135 => 14,   // rt_sigprocmask
+        139 => 15,   // rt_sigreturn
+        // ── System info ───────────────────────────────────────────────────
+        160 => 63,   // uname
+        169 => 99,   // sysinfo (arm64 sysinfo=179? no, 179 is sched_getaffinity; sysinfo=179 on arm64)
+        // ── Networking ────────────────────────────────────────────────────
+        198 => 41,   // socket
+        200 => 49,   // bind
+        203 => 42,   // connect
+        201 => 50,   // listen
+        202 => 43,   // accept
+        206 => 44,   // sendto
+        207 => 45,   // recvfrom
+        208 => 54,   // setsockopt
+        209 => 55,   // getsockopt
+        204 => 51,   // getsockname
+        205 => 52,   // getpeername
+        210 => 46,   // sendmsg
+        211 => 47,   // recvmsg
+        // ── Time ──────────────────────────────────────────────────────────
+        113 => 228,  // clock_gettime
+        116 => 35,   // nanosleep
+        // ── Misc ──────────────────────────────────────────────────────────
+        167 => 101,  // setsid
+        130 => 110,  // setgid (arm64 setgid=144)
+        144 => 106,  // setgid on arm64
+        _   => u64::MAX, // unmapped
+    }
+}
 
 // ── Base64 helper (no external dependency) ────────────────────────────────────
 

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/canary-elf",
     "crates/canary-cpu",
+    "crates/canary-cpu-arm64",
     "crates/canary-memory",
     "crates/canary-syscall",
     "crates/canary-fs",
@@ -10,6 +11,8 @@ members = [
     "crates/canary-thread",
     "crates/canary-jit",
     "crates/canary-net",
+    "crates/canary-io",
+    "crates/canary-input",
     "crates/canary-wasm",
 ]
 
@@ -35,3 +38,4 @@ web-sys     = { version = "0.3", features = ["console"] }
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 bitflags    = "2"
+wasm-encoder = "0.245.1"

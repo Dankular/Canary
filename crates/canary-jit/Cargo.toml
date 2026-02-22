@@ -8,3 +8,4 @@ canary-cpu    = { path = "../canary-cpu" }
 canary-memory = { path = "../canary-memory" }
 thiserror     = { workspace = true }
 log           = { workspace = true }
+wasm-encoder = { workspace = true }

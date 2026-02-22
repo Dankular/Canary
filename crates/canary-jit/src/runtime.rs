@@ -106,6 +106,16 @@ pub fn execute_block(
                 // Non-fatal: log and keep going (matches interpreter behaviour).
                 log::warn!("JIT: unimplemented instruction: {s}");
             }
+            Err(ExecError::IoPort { dir, port, size, val }) => {
+                // I/O port instruction encountered in a JIT block.
+                // The JIT cannot directly handle these (no IoCtx); signal a
+                // fault so the caller falls back to the pure interpreter, which
+                // has the full IoCtx wired up.
+                return JitResult::Fault(format!(
+                    "io-port dir={dir} port={port:#06x} size={size} val={val:#010x} @ {:#x}",
+                    instr_rip(cpu, instr)
+                ));
+            }
         }
     }
 

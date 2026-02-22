@@ -49,6 +49,11 @@ function resolvePath(url) {
     return join(ROOT, p.slice(1));
   }
 
+  // VkWebGPU-ICD assets (served from SteamWeb/VkWebGPU-ICD/pkg/)
+  if (p.startsWith('/vkwebgpu/')) {
+    return join(ROOT, '..', 'SteamWeb', 'VkWebGPU-ICD', 'pkg', p.slice('/vkwebgpu/'.length));
+  }
+
   // harness assets
   const candidate = join(ROOT, 'harness', p.slice(1));
   if (existsSync(candidate)) return candidate;
@@ -106,3 +111,6 @@ server.listen(PORT, () => {
   console.log(`Canary dev server → http://localhost:${PORT}`);
   console.log('Press Ctrl-C to stop.');
 });
+
+// TCP-over-WebSocket proxy: node harness/tcp-proxy.mjs
+// Connect via ws://localhost:3001/tcp/{ip}/{port}

@@ -5,6 +5,17 @@
 use canary_cpu::decoder::{decode, Instruction, Mnemonic};
 use canary_memory::GuestMemory;
 
+// ── JitTier ───────────────────────────────────────────────────────────────────
+
+/// Compilation tier for a cached basic block.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum JitTier {
+    /// Tier-0: decoded instruction list, replayed via interpreter.
+    Interpreted,
+    /// Tier-1: emitted WASM bytecode, compiled by the browser JIT.
+    Compiled,
+}
+
 // ── JitBlock ──────────────────────────────────────────────────────────────────
 
 /// A pre-decoded basic block ready for cached execution.
@@ -28,6 +39,9 @@ pub struct JitBlock {
 
     /// Number of times this block has been entered via the JIT cache.
     pub hit_count: u32,
+
+    /// Compilation tier for this block.
+    pub tier: JitTier,
 }
 
 // ── Terminal-instruction predicates ──────────────────────────────────────────
@@ -137,5 +151,6 @@ pub fn compile_block(entry_rip: u64, mem: &GuestMemory) -> Option<JitBlock> {
         instrs,
         fallthrough,
         hit_count: 0,
+        tier: JitTier::Interpreted,
     })
 }

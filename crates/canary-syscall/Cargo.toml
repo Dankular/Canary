@@ -11,3 +11,5 @@ canary-fs      = { path = "../canary-fs" }
 canary-fb      = { path = "../canary-fb" }
 canary-thread  = { path = "../canary-thread" }
 canary-net     = { path = "../canary-net" }
+canary-io      = { path = "../canary-io" }
+canary-input   = { path = "../canary-input" }

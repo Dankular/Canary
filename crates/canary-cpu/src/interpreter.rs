@@ -25,6 +25,8 @@ pub enum ExecError {
     Int(u8),
     #[error("unimplemented instruction: {0:?}")]
     Unimplemented(String),
+    #[error("I/O port: dir={dir} port={port:#06x} size={size} val={val:#010x}")]
+    IoPort { dir: u8, port: u16, size: u8, val: u32 },
 }
 
 pub type ExecResult<T> = Result<T, ExecError>;
@@ -693,6 +695,25 @@ pub fn execute(
                 if instr.prefixes.rep == 0xF2 && cpu.rflags & ZF == 0 { break; } // REPNE
             }
             if instr.prefixes.rep != 0 { cpu.gpr[reg::RCX] = remaining; }
+        }
+
+        // ── OUT DX, AL/AX/EAX ────────────────────────────────────────────
+        Out => {
+            let port = cpu.read32(reg::RDX) as u16;
+            let val = match instr.op_size {
+                8  => cpu.read8(reg::RAX, false) as u32,
+                16 => cpu.read16(reg::RAX) as u32,
+                _  => cpu.read32(reg::RAX),
+            };
+            cpu.rip = next_rip;
+            return Err(ExecError::IoPort { dir: 1, port, size: instr.op_size, val });
+        }
+
+        // ── IN AL/AX/EAX, DX ─────────────────────────────────────────────
+        In => {
+            let port = cpu.read32(reg::RDX) as u16;
+            cpu.rip = next_rip;
+            return Err(ExecError::IoPort { dir: 0, port, size: instr.op_size, val: 0 });
         }
 
         // ── Unimplemented — continue for now ─────────────────────────────

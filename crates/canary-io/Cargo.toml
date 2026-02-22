@@ -1,0 +1,7 @@
+[package]
+name = "canary-io"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }

@@ -12,7 +12,8 @@ pub const ET_EXEC: u16 = 2; // static executable
 pub const ET_DYN:  u16 = 3; // shared / PIE
 
 // ── e_machine ─────────────────────────────────────────────────────────────────
-pub const EM_X86_64: u16 = 62;
+pub const EM_X86_64:  u16 = 62;
+pub const EM_AARCH64: u16 = 183;
 
 // ── p_type ────────────────────────────────────────────────────────────────────
 pub const PT_NULL:         u32 = 0;

@@ -216,6 +216,22 @@ impl Elf64 {
         if header.e_machine != EM_X86_64 {
             return Err(ElfError::WrongArch(header.e_machine));
         }
+
+        Self::parse_with_header(data, preferred_base, header)
+    }
+
+    /// Parse an ELF64 AArch64 binary.  Same semantics as `parse()`.
+    pub fn parse_aarch64(data: &[u8], preferred_base: u64) -> ElfResult<Self> {
+        let header = parse_ehdr(data)?;
+
+        if header.e_machine != EM_AARCH64 {
+            return Err(ElfError::WrongArch(header.e_machine));
+        }
+
+        Self::parse_with_header(data, preferred_base, header)
+    }
+
+    fn parse_with_header(data: &[u8], preferred_base: u64, header: Elf64Ehdr) -> ElfResult<Self> {
         if header.e_type != ET_EXEC && header.e_type != ET_DYN {
             return Err(ElfError::UnsupportedType(header.e_type));
         }

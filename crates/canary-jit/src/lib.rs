@@ -15,6 +15,7 @@
 //! emission without changing the public API.
 
 pub mod block;
+pub mod emitter;
 pub mod runtime;
 
 use std::collections::HashMap;
@@ -22,7 +23,7 @@ use std::collections::HashMap;
 use canary_cpu::registers::CpuState;
 use canary_memory::GuestMemory;
 
-pub use block::JitBlock;
+pub use block::{JitBlock, JitTier};
 pub use runtime::JitResult;
 
 // ── JitCache ──────────────────────────────────────────────────────────────────

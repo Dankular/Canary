@@ -82,7 +82,7 @@ function runNetworkPoll() {
   for (const req of connects) {
     if (_wsMap.has(req.fd)) continue;   // already connecting
     try {
-      const url = `ws://${req.ip}:${req.port}`;
+      const url = `ws://localhost:3001/tcp/${req.ip}/${req.port}`;
       const ws = new WebSocket(url);
       ws.binaryType = 'arraybuffer';
       ws.onopen = () => {
@@ -117,6 +117,161 @@ function runNetworkPoll() {
   scheduleNetworkPoll();
 }
 
+// ── WebX GPU bridge (port 0x7860) ─────────────────────────────────────────────
+//
+// The guest runs libvkwebx.so which communicates via x86 I/O port 0x7860.
+// We relay OUT writes to a VkWebGPU-ICD WASM module and push IN responses
+// back for the guest to read.
+//
+// Packet framing: see WebX protocol/commands.h
+//   Header: [magic:4][cmd:4][seq:4][len:4]  (16 bytes, little-endian)
+//   Response: [seq:4][result:4][len:4]       (12 bytes)
+//
+// The VkWebGPU-ICD module is loaded lazily on first GPU activity.
+
+const WEBX_PORT = 0x7860;
+let vkPlugin = null;  // Will be set to VkWebGPU-ICD when loaded.
+
+// Buffer accumulating bytes from guest OUT writes.
+let _ioWriteBuffer = [];
+
+async function loadVkPlugin() {
+  try {
+    // Try to load the VkWebGPU-ICD WASM module.
+    // The module is expected at /vkwebgpu/vkwebgpu.js (add to server routes if needed).
+    const mod = await import('/vkwebgpu/vkwebgpu.js');
+    vkPlugin = await mod.default();
+    console.log('[canary] VkWebGPU-ICD loaded');
+  } catch (e) {
+    console.warn('[canary] VkWebGPU-ICD not found:', e.message);
+    // Fall back to a null plugin that returns VK_ERROR_INITIALIZATION_FAILED.
+    vkPlugin = {
+      dispatch: (_cmd, _payload) => new Uint8Array([0, 0, 0, 0, 0xfa, 0xff, 0xff, 0xff, 0, 0, 0, 0])
+    };
+  }
+}
+
+function startWebXBridge(rt) {
+  loadVkPlugin();
+  scheduleIoPoll(rt);
+}
+
+function scheduleIoPoll(rt) {
+  requestAnimationFrame(() => runIoPoll(rt));
+}
+
+function runIoPoll(rt) {
+  if (!rt) return;
+
+  try {
+    const writesJson = rt.drain_io_writes();
+    const writes = JSON.parse(writesJson || '[]');
+
+    for (const w of writes) {
+      if (w.port !== WEBX_PORT) continue;
+
+      // Accumulate bytes written to port 0x7860.
+      // The guest writes 4 bytes at a time (dword OUT).
+      _ioWriteBuffer.push(
+        (w.val) & 0xFF,
+        (w.val >> 8) & 0xFF,
+        (w.val >> 16) & 0xFF,
+        (w.val >> 24) & 0xFF,
+      );
+
+      // Check if we have a complete packet header (16 bytes).
+      if (_ioWriteBuffer.length >= 16) {
+        const hdr = new DataView(new Uint8Array(_ioWriteBuffer.slice(0, 16)).buffer);
+        const magic = hdr.getUint32(0, true);
+        if (magic === 0x58574756) {  // "VGWX"
+          const payloadLen = hdr.getUint32(12, true);
+          const totalLen = 16 + payloadLen;
+          if (_ioWriteBuffer.length >= totalLen) {
+            const packet = new Uint8Array(_ioWriteBuffer.splice(0, totalLen));
+            // Dispatch to VkWebGPU-ICD and get response.
+            const cmd = hdr.getUint32(4, true);
+            const seq = hdr.getUint32(8, true);
+            const payload = packet.slice(16);
+
+            if (vkPlugin) {
+              const resp = vkPlugin.dispatch(cmd, payload, seq);
+              // Push response bytes back as IN reads.
+              if (resp instanceof Uint8Array) {
+                for (let i = 0; i < resp.length; i += 4) {
+                  const v = (resp[i] | (resp[i+1] << 8) |
+                             (resp[i+2] << 16) | (resp[i+3] << 24)) >>> 0;
+                  rt.push_io_read(WEBX_PORT, 4, v);
+                }
+              }
+            }
+          }
+        } else {
+          // Bad magic — discard one byte and retry.
+          _ioWriteBuffer.shift();
+        }
+      }
+    }
+  } catch (e) { /* don't let errors stop the bridge */ }
+
+  scheduleIoPoll(rt);
+}
+
+// ── Thread spawner ────────────────────────────────────────────────────────────
+//
+// When the guest calls clone(), the WASM runtime queues a CloneInfo record that
+// the JS harness drains after each step batch.  spawnThread() creates a Web
+// Worker, sends it the shared WASM module + memory, and starts its execution.
+
+let _wasmModule = null;    // cached WebAssembly.Module for sharing with Workers
+let _sharedMemory = null;  // cached shared WebAssembly.Memory (SAB-backed, or null)
+
+const _workers = new Map();  // tid → Worker
+
+async function spawnThread(cloneReq) {
+  const { tid, child_stack, tls, child_tidptr } = cloneReq;
+
+  const worker = new Worker(new URL('./worker.mjs', import.meta.url), { type: 'module' });
+  _workers.set(tid, worker);
+
+  worker.onmessage = (e) => {
+    const msg = e.data;
+    if (msg.type === 'stdout') {
+      print(new TextDecoder().decode(msg.data), 'log-stdout');
+    } else if (msg.type === 'stderr') {
+      print(new TextDecoder().decode(msg.data), 'log-stderr');
+    } else if (msg.type === 'clone') {
+      const reqs = JSON.parse(msg.requests);
+      for (const req of reqs) spawnThread(req).catch(console.error);
+    } else if (msg.type === 'exit') {
+      _workers.delete(tid);
+    }
+  };
+
+  worker.postMessage({
+    type: 'init',
+    wasmModule: _wasmModule,
+    sharedMemory: _sharedMemory,
+    tid,
+    childStack: child_stack,
+    tls,
+    childTidptr: child_tidptr,
+  }, _sharedMemory ? [_sharedMemory] : []);
+
+  // Wait for 'ready' then start running.
+  await new Promise((resolve) => {
+    const orig = worker.onmessage;
+    worker.onmessage = (e) => {
+      if (e.data.type === 'ready') {
+        worker.onmessage = orig;
+        resolve();
+      } else {
+        orig(e);
+      }
+    };
+  });
+  worker.postMessage({ type: 'run' });
+}
+
 // ── Main entry point ──────────────────────────────────────────────────────────
 
 export async function canaryMain() {
@@ -126,16 +281,43 @@ export async function canaryMain() {
 
     // Dynamically import the wasm-pack output.
     const wasmMod = await import('../crates/canary-wasm/pkg/canary_wasm.js');
-    await wasmMod.default(); // initialise WASM (calls __wbg_init)
+    const wasmInitResult = await wasmMod.default(); // initialise WASM (calls __wbg_init)
+
+    // Cache the compiled module and (optional) shared memory for Worker spawning.
+    // wasmInitResult may be a WebAssembly.Instance; extract module if available.
+    if (wasmInitResult && wasmInitResult.module) {
+      _wasmModule = wasmInitResult.module;
+    }
+    if (wasmInitResult && wasmInitResult.memory) {
+      _sharedMemory = wasmInitResult.memory;
+    }
 
     const { CanaryRuntime } = wasmMod;
     const rt = new CanaryRuntime();
+
+    // ── Pre-populate Vulkan ICD configuration ─────────────────────────────
+    // The Vulkan loader (libvulkan.so) looks for ICDs in /etc/vulkan/icd.d/.
+    // We point it at libvkwebx.so so the guest finds the WebX ICD automatically.
+    const enc = new TextEncoder();
+    rt.add_file('/etc/vulkan/icd.d/webx.json', enc.encode(JSON.stringify({
+      file_format_version: '1.0.0',
+      ICD: {
+        library_path: '/usr/lib/x86_64-linux-gnu/libvkwebx.so',
+        api_version: '1.3.0'
+      }
+    })));
+    // /proc stubs needed by the Vulkan loader / glibc.
+    rt.add_file('/proc/version', enc.encode('Linux version 6.1.0-canary (gcc 12.3.0)'));
 
     // ── Start the WebSocket network bridge ────────────────────────────────
     // This RAF loop polls for connect/send events from the WASM module and
     // forwards them via WebSocket.  It starts immediately; it won't do
     // anything until the guest calls socket()/connect().
     startNetworkBridge(rt);
+
+    // ── Start the WebX GPU IPC bridge ─────────────────────────────────────
+    // Relays x86 IN/OUT port 0x7860 to the VkWebGPU-ICD WASM module.
+    startWebXBridge(rt);
 
     // ── Framebuffer rendering loop ─────────────────────────────────────────
     // Reads BGRA pixels from the guest's /dev/fb0 mapping and blits them
@@ -165,24 +347,31 @@ export async function canaryMain() {
 
     // ── Input event forwarding ────────────────────────────────────────────
     // Keyboard and mouse events on the canvas are forwarded to the runtime
-    // (stub — extend when /dev/input emulation is added).
+    // via the evdev /dev/input/event0 emulation layer.
     if (canvas) {
       canvas.addEventListener('keydown', e => {
-        // TODO: map KeyboardEvent.code → Linux key code and push to input queue.
         e.preventDefault();
+        rt.push_key_event(e.code, true);
+      });
+      canvas.addEventListener('keyup', e => {
+        e.preventDefault();
+        rt.push_key_event(e.code, false);
       });
       canvas.addEventListener('mousemove', e => {
         const rect = canvas.getBoundingClientRect();
         const x = Math.round((e.clientX - rect.left) * (1024 / rect.width));
         const y = Math.round((e.clientY - rect.top)  * (768  / rect.height));
-        if (rt.push_mouse_event) rt.push_mouse_event(x, y, 0);
+        rt.push_mouse_move(x, y);
       });
       canvas.addEventListener('mousedown', e => {
-        if (rt.push_mouse_event) rt.push_mouse_event(0, 0, e.buttons);
+        rt.push_mouse_button(e.button, true);
       });
       canvas.addEventListener('mouseup', e => {
-        if (rt.push_mouse_event) rt.push_mouse_event(0, 0, 0);
+        rt.push_mouse_button(e.button, false);
       });
+      // Capture keyboard focus when canvas is clicked.
+      canvas.addEventListener('click', () => canvas.focus());
+      canvas.setAttribute('tabindex', '0');
     }
 
     print('[canary] WASM module ready.', 'log-ok');
@@ -247,6 +436,14 @@ export async function canaryMain() {
     const t0 = performance.now();
     const exitCode = rt.run_elf(elfBytes, argvJson, envpJson);
     const elapsed  = (performance.now() - t0).toFixed(0);
+
+    // Drain any clone() requests queued during synchronous execution and spawn Workers.
+    try {
+      const cloneRequests = JSON.parse(rt.drain_clone_requests() || '[]');
+      for (const req of cloneRequests) {
+        spawnThread(req).catch(console.error);
+      }
+    } catch (_) {}
 
     // ── Flush output ──────────────────────────────────────────────────────
     const stdout = rt.drain_stdout();
