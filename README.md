@@ -2,25 +2,6 @@
 
 A from-scratch Linux ELF emulator written in Rust, compiled to WebAssembly. Runs unmodified 64-bit Linux binaries directly in the browser — no plugins, no CDN, no native code. Supports both **x86-64** and **AArch64** ELF binaries.
 
-### Key differences from CheerpX
-
-| Feature | CheerpX | Canary |
-|---|---|---|
-| Architecture | x86 (32-bit only) | **x86-64 + AArch64 (64-bit)** |
-| ELF support | ET_EXEC 32-bit | **ET_EXEC + ET_DYN (PIE) 64-bit** |
-| Syscall ABI | `INT 0x80` (i386) | **`SYSCALL` (x86-64) / `SVC #0` (AArch64)** |
-| Registers | 8 GPRs (EAX–EDI) | **x86-64: 16 GPRs + XMM / AArch64: X0–X30 + SP** |
-| Runtime | Closed-source CDN binary | **Open-source Rust → WASM** |
-| CDN dependency | Required | **None — fully self-hosted** |
-| TLS support | Limited | **FS.base (x86-64) / TPIDR_EL0 (AArch64)** |
-| Threads | ❌ | **pthreads via SharedArrayBuffer + Web Workers** |
-| Networking | ❌ | **BSD sockets → WebSocket bridge** |
-| Graphical output | ❌ | **/dev/fb0 framebuffer → Canvas** |
-| JIT | Interpreter only | **Basic-block JIT (decode-once cache)** |
-| Signal delivery | ❌ | **rt_sigaction, ucontext frames, rt_sigreturn** |
-| execve | ENOSYS | **Full process replacement** |
-| Address space | 4 GiB limit | **Full 64-bit VA (page-table memory)** |
-
 ## Architecture
 
 ```
