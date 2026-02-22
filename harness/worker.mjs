@@ -42,13 +42,22 @@ self.onmessage = async (event) => {
                 // Set this Worker's TID so syscalls return the right gettid() value.
                 rt.set_current_tid(msg.tid);
 
-                // Initialize the thread's stack pointer and TLS.
-                // The thread starts executing after the clone() syscall returns 0 in RAX.
-                // child_stack is the new RSP; tls is the FS base (set via arch_prctl).
+                // Restore the parent's address space so the child thread sees
+                // the same code, stack, heap, and TLS pages as the parent did
+                // at the moment clone() was called.
+                if (msg.snapshot) {
+                    const ok = rt.restore_pages(new Uint8Array(msg.snapshot));
+                    if (!ok) console.error('[worker] restore_pages failed — child may fault');
+                }
+
+                // Initialize the thread's registers.
+                // rip  = next instruction after parent's syscall
+                // child_stack = new RSP; tls = FS base; child_tidptr = ctid
                 rt.init_thread(
                     BigInt(msg.childStack),
                     BigInt(msg.tls),
                     BigInt(msg.childTidptr),
+                    BigInt(msg.rip || 0),
                 );
 
                 self.postMessage({ type: 'ready' });

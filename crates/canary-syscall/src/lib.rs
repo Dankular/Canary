@@ -32,6 +32,10 @@ pub struct CloneInfo {
     pub tls: u64,
     /// The TID that was allocated for the new thread.
     pub new_tid: u32,
+    /// Instruction pointer where the child thread resumes (next instruction
+    /// after the `syscall` that invoked clone).  Patched by `canary-wasm`'s
+    /// `dispatch_syscall` because `handle_syscall` does not have access to RIP.
+    pub rip: u64,
 }
 
 #[derive(Debug, Error)]

@@ -1185,6 +1185,7 @@ pub fn handle_syscall(
                 child_tidptr,
                 tls,
                 new_tid,
+                rip: 0, // patched by canary-wasm's dispatch_syscall
             };
             ctx.pending_clone.push(info);
 

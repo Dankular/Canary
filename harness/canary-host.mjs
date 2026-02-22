@@ -229,7 +229,15 @@ let _sharedMemory = null;  // cached shared WebAssembly.Memory (SAB-backed, or n
 const _workers = new Map();  // tid → Worker
 
 async function spawnThread(cloneReq) {
-  const { tid, child_stack, tls, child_tidptr } = cloneReq;
+  const { tid, child_stack, tls, child_tidptr, rip } = cloneReq;
+
+  // Snapshot parent address space so the child Worker starts with identical pages.
+  // snapshot_pages() returns a Uint8Array backed by a JS ArrayBuffer (not WASM
+  // linear memory), so we can transfer it zero-copy to the Worker.
+  const snapshot = rt.snapshot_pages();
+  // Grab the underlying buffer; slice() ensures we own an independent copy even
+  // if the Uint8Array is a view into a larger buffer.
+  const snapshotBuf = snapshot.buffer.slice(snapshot.byteOffset, snapshot.byteOffset + snapshot.byteLength);
 
   const worker = new Worker(new URL('./worker.mjs', import.meta.url), { type: 'module' });
   _workers.set(tid, worker);
@@ -248,6 +256,9 @@ async function spawnThread(cloneReq) {
     }
   };
 
+  const transferList = [snapshotBuf];
+  if (_sharedMemory) transferList.push(_sharedMemory);
+
   worker.postMessage({
     type: 'init',
     wasmModule: _wasmModule,
@@ -256,7 +267,9 @@ async function spawnThread(cloneReq) {
     childStack: child_stack,
     tls,
     childTidptr: child_tidptr,
-  }, _sharedMemory ? [_sharedMemory] : []);
+    rip,
+    snapshot: snapshotBuf,
+  }, transferList);
 
   // Wait for 'ready' then start running.
   await new Promise((resolve) => {

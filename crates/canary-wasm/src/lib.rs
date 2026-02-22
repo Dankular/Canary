@@ -234,13 +234,17 @@ impl CanaryRuntime {
     // ── Threading API ─────────────────────────────────────────────────────
 
     /// Initialize a thread Worker's register state.
-    /// Called from a Web Worker after init, before run.
-    /// Sets RSP to child_stack, FS base to tls, writes tid to child_tidptr.
+    /// Called from a Web Worker after `restore_pages()`, before run.
+    /// Sets RIP, RSP, FS base, and writes tid to child_tidptr.
     #[wasm_bindgen]
-    pub fn init_thread(&mut self, child_stack: u64, tls: u64, child_tidptr: u64) {
+    pub fn init_thread(&mut self, child_stack: u64, tls: u64, child_tidptr: u64, rip: u64) {
         use canary_cpu::registers::reg;
         // Child thread starts with RAX=0 (clone returns 0 in child)
         self.cpu.gpr[reg::RAX] = 0;
+        // RIP = next instruction after the parent's syscall
+        if rip != 0 {
+            self.cpu.rip = rip;
+        }
         // RSP = child_stack (passed in clone() call)
         if child_stack != 0 {
             self.cpu.gpr[reg::RSP] = child_stack;
@@ -254,6 +258,21 @@ impl CanaryRuntime {
             let tid = self.ctx.current_tid;
             self.mem.write_u32(child_tidptr, tid).ok();
         }
+    }
+
+    /// Snapshot all mapped guest pages into a transferable binary blob.
+    /// Pass this blob to a Worker's `restore_pages()` so the child thread
+    /// starts with the same address space as the parent.
+    #[wasm_bindgen]
+    pub fn snapshot_pages(&self) -> Vec<u8> {
+        self.mem.snapshot_pages()
+    }
+
+    /// Restore guest memory from a blob produced by the parent's `snapshot_pages()`.
+    /// Must be called before `init_thread()`.
+    #[wasm_bindgen]
+    pub fn restore_pages(&mut self, blob: &[u8]) -> bool {
+        self.mem.restore_pages(blob)
     }
 
     /// Drain any pending `clone` requests and return them as a JSON array.
@@ -274,8 +293,8 @@ impl CanaryRuntime {
             .iter()
             .map(|r| {
                 format!(
-                    r#"{{"tid":{},"child_stack":{},"tls":{},"child_tidptr":{},"flags":{}}}"#,
-                    r.new_tid, r.child_stack, r.tls, r.child_tidptr, r.flags
+                    r#"{{"tid":{},"child_stack":{},"tls":{},"child_tidptr":{},"flags":{},"rip":{}}}"#,
+                    r.new_tid, r.child_stack, r.tls, r.child_tidptr, r.flags, r.rip
                 )
             })
             .collect();
@@ -868,9 +887,11 @@ impl CanaryRuntime {
                 tls: _, flags: _,
             }) => {
                 // The CloneInfo was already pushed into ctx.pending_clone by the
-                // syscall handler.  In the parent we return the new TID in RAX
-                // (same as real Linux).  The JS harness calls drain_clone_requests()
-                // after each step and spawns a Worker for each entry.
+                // syscall handler.  Patch RIP so the child resumes at the
+                // instruction after the syscall (cpu.rip is already advanced).
+                if let Some(last) = self.ctx.pending_clone.last_mut() {
+                    last.rip = self.cpu.rip;
+                }
                 self.cpu.fs_base = fs_base;
                 self.cpu.gs_base = gs_base;
                 self.cpu.gpr[reg::RAX] = new_tid as u64;

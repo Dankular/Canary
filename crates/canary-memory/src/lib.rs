@@ -586,6 +586,129 @@ impl GuestMemory {
         let zeros = vec![0u8; len];
         self.loader_write(guest_addr, &zeros);
     }
+
+    // ── Memory snapshot / restore (for thread spawning) ───────────────────
+
+    /// Serialize the entire guest address space into a compact binary blob.
+    ///
+    /// Format:
+    /// ```text
+    /// [u32 magic=0x434E5259] [u32 n_pages]
+    /// ( [u64 page_num] [4096 bytes] ) × n_pages
+    /// [u32 n_mappings]
+    /// ( [u64 guest_start] [u64 length] [u8 prot_bits] ) × n_mappings
+    /// [u64 mmap_brk] [u64 program_brk]
+    /// ```
+    ///
+    /// The blob can be transferred to a Worker which calls `restore_pages()`
+    /// to recreate an identical `GuestMemory` for the child thread.
+    pub fn snapshot_pages(&self) -> Vec<u8> {
+        let n_pages = self.page_table.len();
+        let n_maps  = self.mappings.len();
+        let capacity = 4 + 4 + n_pages * (8 + PAGE_SIZE as usize)
+                     + 4 + n_maps * (8 + 8 + 1)
+                     + 8 + 8;
+        let mut out = Vec::with_capacity(capacity);
+
+        // Header
+        out.extend_from_slice(&0x434E_5259u32.to_le_bytes());
+        out.extend_from_slice(&(n_pages as u32).to_le_bytes());
+
+        // Pages: iterate sorted for determinism
+        let mut pages: Vec<(u64, u32)> = self.page_table.iter().map(|(&k, &v)| (k, v)).collect();
+        pages.sort_unstable_by_key(|&(k, _)| k);
+        for (page_num, frame_idx) in pages {
+            out.extend_from_slice(&page_num.to_le_bytes());
+            let start = frame_idx as usize * PAGE_SIZE as usize;
+            out.extend_from_slice(&self.data[start..start + PAGE_SIZE as usize]);
+        }
+
+        // Mappings
+        out.extend_from_slice(&(n_maps as u32).to_le_bytes());
+        for m in self.mappings.values() {
+            out.extend_from_slice(&m.guest_start.to_le_bytes());
+            out.extend_from_slice(&m.length.to_le_bytes());
+            out.push(m.prot.bits());
+        }
+
+        // Metadata
+        out.extend_from_slice(&self.mmap_brk.to_le_bytes());
+        out.extend_from_slice(&self.program_brk.to_le_bytes());
+
+        out
+    }
+
+    /// Restore a guest address space from a blob produced by `snapshot_pages()`.
+    /// Completely replaces the current memory state.  Returns `false` on parse error.
+    #[allow(unused_assignments)]
+    pub fn restore_pages(&mut self, blob: &[u8]) -> bool {
+        let mut pos = 0usize;
+
+        macro_rules! read_u8 {
+            () => {{
+                if pos >= blob.len() { return false; }
+                let v = blob[pos]; pos += 1; v
+            }}
+        }
+        macro_rules! read_u32 {
+            () => {{
+                if pos + 4 > blob.len() { return false; }
+                let v = u32::from_le_bytes(blob[pos..pos+4].try_into().unwrap());
+                pos += 4; v
+            }}
+        }
+        macro_rules! read_u64 {
+            () => {{
+                if pos + 8 > blob.len() { return false; }
+                let v = u64::from_le_bytes(blob[pos..pos+8].try_into().unwrap());
+                pos += 8; v
+            }}
+        }
+
+        let magic = read_u32!();
+        if magic != 0x434E_5259 { return false; }
+
+        let n_pages = read_u32!() as usize;
+
+        // Reset state
+        self.data.clear();
+        self.frame_count = 0;
+        self.page_table.clear();
+        self.mappings.clear();
+
+        // Restore pages in the order they were serialised.
+        for _ in 0..n_pages {
+            let page_num = read_u64!();
+            if pos + PAGE_SIZE as usize > blob.len() { return false; }
+            let frame = self.alloc_frame();
+            self.page_table.insert(page_num, frame);
+            let start = frame as usize * PAGE_SIZE as usize;
+            self.data[start..start + PAGE_SIZE as usize]
+                .copy_from_slice(&blob[pos..pos + PAGE_SIZE as usize]);
+            pos += PAGE_SIZE as usize;
+        }
+
+        // Restore mappings
+        let n_maps = read_u32!() as usize;
+        for _ in 0..n_maps {
+            let guest_start = read_u64!();
+            let length      = read_u64!();
+            let prot_bits   = read_u8!();
+            let prot        = Prot::from_bits_truncate(prot_bits);
+            self.mappings.insert(guest_start, Mapping {
+                guest_start,
+                length,
+                prot,
+                wasm_offset: 0,
+            });
+        }
+
+        // Metadata
+        self.mmap_brk    = read_u64!();
+        self.program_brk = read_u64!();
+
+        true
+    }
 }
 
 // ── ElfLoader trait ───────────────────────────────────────────────────────────
