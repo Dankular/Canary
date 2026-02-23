@@ -1,5 +1,9 @@
 //! Canary WASM entry point — exposed to JavaScript via wasm-bindgen.
 
+mod ext2_remote;
+
+use std::cell::RefCell;
+use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
 use canary_elf::{Elf64, ElfError, EM_AARCH64};
 use canary_memory::{GuestMemory, layout, Prot, MapFlags};
@@ -23,6 +27,80 @@ extern "C" {
     fn warn(s: &str);
     #[wasm_bindgen(js_namespace = console)]
     fn error(s: &str);
+}
+
+// ── Staged VFS (for lazy ext2 loading) ───────────────────────────────────────
+
+// MemFs built by `stage_vfs_from_url` — held here until `apply_staged_vfs` moves it.
+thread_local! {
+    static VFS_STAGING:    RefCell<Option<canary_fs::MemFs>>              = RefCell::new(None);
+    // Kept alive after staging so `fetch_ext2_file` can fetch individual files on demand.
+    static EXT2_READER:    RefCell<Option<ext2_remote::RemoteExt2>>       = RefCell::new(None);
+    static EXT2_INODE_MAP: RefCell<HashMap<String, u32>>                  = RefCell::new(HashMap::new());
+}
+
+/// Traverse the ext2/ext4 image at `url` via HTTP Range requests and build a
+/// MemFs in the thread-local staging area.
+///
+/// Call `rt.apply_staged_vfs()` after this completes to install the result.
+///
+/// This is a free async function (not a method) because wasm-bindgen does not
+/// support `async fn` on `&mut self` struct methods.
+#[wasm_bindgen]
+pub async fn stage_vfs_from_url(url: String) -> Result<(), JsValue> {
+    log(&format!("Canary: stage_vfs_from_url starting — {url}"));
+
+    let mut reader = ext2_remote::RemoteExt2::new(url);
+
+    if !reader.init().await {
+        return Err(JsValue::from_str(
+            "stage_vfs_from_url: failed to read ext2 superblock — check URL and server Range support",
+        ));
+    }
+    log("Canary: ext2 superblock parsed, traversing filesystem…");
+
+    let mut staging_fs = canary_fs::MemFs::new();
+    let mut inode_map  = HashMap::<String, u32>::new();
+    if !reader.populate_memfs(&mut staging_fs, &mut inode_map).await {
+        return Err(JsValue::from_str(
+            "stage_vfs_from_url: filesystem traversal failed",
+        ));
+    }
+
+    log(&format!("Canary: ext2 traversal complete — {} paths indexed, VFS staged", inode_map.len()));
+    VFS_STAGING.with(|cell| { *cell.borrow_mut() = Some(staging_fs); });
+    EXT2_INODE_MAP.with(|cell| { *cell.borrow_mut() = inode_map; });
+    EXT2_READER.with(|cell| { *cell.borrow_mut() = Some(reader); });
+    Ok(())
+}
+
+/// Fetch the raw content of a file from the ext2 image by its VFS path.
+///
+/// Returns the file bytes as a `Uint8Array`, or rejects if the path is unknown
+/// or the network fetch fails.  The ext2 reader and inode map are populated by
+/// `stage_vfs_from_url` and remain available until the page is unloaded.
+#[wasm_bindgen]
+pub async fn fetch_ext2_file(path: String) -> Result<js_sys::Uint8Array, JsValue> {
+    // Look up inode number from the indexed map.
+    let ino = EXT2_INODE_MAP.with(|m| m.borrow().get(&path).copied());
+    let ino = ino.ok_or_else(|| JsValue::from_str(&format!(
+        "fetch_ext2_file: path not in ext2 index: {path}"
+    )))?;
+
+    // Take the reader out of thread_local (can't hold a RefCell borrow across .await).
+    let mut reader = EXT2_READER.with(|r| r.borrow_mut().take())
+        .ok_or_else(|| JsValue::from_str("fetch_ext2_file: ext2 reader not available"))?;
+
+    let result = reader.fetch_file(ino).await;
+
+    // Always put the reader back, even on error.
+    EXT2_READER.with(|r| *r.borrow_mut() = Some(reader));
+
+    let data = result.ok_or_else(|| JsValue::from_str(&format!(
+        "fetch_ext2_file: failed to read inode {ino} for {path}"
+    )))?;
+
+    Ok(js_sys::Uint8Array::from(data.as_slice()))
 }
 
 // ── Canary runtime ────────────────────────────────────────────────────────────
@@ -60,6 +138,26 @@ impl CanaryRuntime {
             log("Canary: ext2 filesystem loaded successfully");
         } else {
             warn("Canary: load_fs_image — not a valid ext2 image, ignoring");
+        }
+    }
+
+    /// Install the VFS built by `stage_vfs_from_url` into this runtime.
+    ///
+    /// Returns `true` if a staged VFS was available and has been merged,
+    /// `false` if `stage_vfs_from_url` had not been called or already consumed.
+    #[wasm_bindgen]
+    pub fn apply_staged_vfs(&mut self) -> bool {
+        let staged = VFS_STAGING.with(|cell| cell.borrow_mut().take());
+        match staged {
+            Some(fs) => {
+                fs.apply_to(&mut self.ctx.vfs.mem);
+                log("Canary: staged VFS applied to runtime");
+                true
+            }
+            None => {
+                warn("Canary: apply_staged_vfs called but no staged VFS available");
+                false
+            }
         }
     }
 
@@ -622,7 +720,12 @@ impl CanaryRuntime {
                 if seg.flags & canary_elf::PF_X != 0 { p |= Prot::EXEC; }
                 p
             };
-            self.mem.mmap(seg.vaddr, seg.memsz, prot | Prot::WRITE,
+            // ELF spec allows p_vaddr to be unaligned (only requires congruence
+            // with p_offset modulo page size).  Linux always rounds down to the
+            // nearest page boundary for mmap(MAP_FIXED), so we do the same.
+            let map_start = seg.vaddr & !0xFFF_u64;
+            let map_size  = (seg.vaddr - map_start + seg.memsz + 0xFFF) & !0xFFF_u64;
+            self.mem.mmap(map_start, map_size, prot | Prot::WRITE,
                           MapFlags::FIXED | MapFlags::PRIVATE | MapFlags::ANONYMOUS)
                 .map_err(|e| CanaryError::Exec(e.to_string()))?;
         }

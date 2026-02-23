@@ -632,6 +632,31 @@ pub fn execute(
             cpu.write32(reg::RDX, (tsc >> 32) as u32);
         }
 
+        // ── RDTSCP ───────────────────────────────────────────────────────
+        Rdtscp => {
+            // Like RDTSC but also writes IA32_TSC_AUX (processor ID) into ECX.
+            static TSC2: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let tsc = TSC2.fetch_add(1000, std::sync::atomic::Ordering::Relaxed);
+            cpu.write32(reg::RAX, tsc as u32);
+            cpu.write32(reg::RDX, (tsc >> 32) as u32);
+            cpu.write32(reg::RCX, 0); // processor ID = 0 (single core)
+        }
+
+        // ── XGETBV ───────────────────────────────────────────────────────
+        Xgetbv => {
+            // Read Extended Control Register XCR[ECX] into EDX:EAX.
+            // We advertise XCR0 = 0x3 (x87 + SSE state saved by OS) which
+            // tells glibc that SSE is available but AVX (bit 2) is not,
+            // preventing it from emitting YMM instructions we don't support.
+            let xcr = cpu.gpr[reg::RCX] as u32;
+            let (edx, eax): (u32, u32) = match xcr {
+                0 => (0, 0x3), // XCR0: FPU (bit 0) + SSE (bit 1) only
+                _ => (0, 0),
+            };
+            cpu.write32(reg::RAX, eax);
+            cpu.write32(reg::RDX, edx);
+        }
+
         // ── String instructions ───────────────────────────────────────────
         Movs => {
             let dir    = if cpu.rflags & DF != 0 { u64::MAX } else { 1 };

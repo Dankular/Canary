@@ -32,9 +32,15 @@ panic         = "abort"
 canary-memory = { path = "crates/canary-memory" }
 thiserror   = "1"
 log         = "0.4"
-wasm-bindgen = "0.2"
-js-sys      = "0.3"
-web-sys     = { version = "0.3", features = ["console"] }
+wasm-bindgen          = "0.2"
+wasm-bindgen-futures  = "0.4"
+js-sys                = "0.3"
+web-sys               = { version = "0.3", features = [
+    "console",
+    "Window",
+    "Request", "RequestInit", "RequestMode",
+    "Response", "Headers",
+] }
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 bitflags    = "2"

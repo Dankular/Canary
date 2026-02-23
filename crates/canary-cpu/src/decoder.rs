@@ -147,7 +147,7 @@ pub enum Mnemonic {
     Clc, Stc, Cld, Std, Cli, Sti, Cmc,
     Lahf, Sahf, Pushf, Popf,
     // Misc
-    Nop, Hlt, Cpuid, Rdtsc, Xgetbv,
+    Nop, Hlt, Cpuid, Rdtsc, Rdtscp, Xgetbv,
     // Conditionals
     Setcc(u8), Cmovcc(u8),
     // Cmpxchg / atomics
@@ -714,6 +714,20 @@ fn decode_2byte(r: &mut ByteReader, op: u8, pfx: &Prefixes, op_size: u8, _rip: u
         0x0B => (Ud2,     0, vec![]),
         0x31 => (Rdtsc,   0, vec![]),
         0xA2 => (Cpuid,   0, vec![]),
+
+        // ── 0F 01 group — system instructions with ModRM/fixed-byte discriminator
+        0x01 => {
+            let discriminator = r.read()?;
+            match discriminator {
+                0xC8 => (Nop,    0, vec![]),   // MONITOR  — no-op in user mode
+                0xC9 => (Nop,    0, vec![]),   // MWAIT    — no-op in user mode
+                0xD0 => (Xgetbv, 0, vec![]),   // XGETBV   — read XCR[ECX] into EDX:EAX
+                0xD5 => (Nop,    0, vec![]),   // XEND     — no-op (no HTM)
+                0xF8 => (Nop,    0, vec![]),   // SWAPGS   — no-op in ring-3 context
+                0xF9 => (Rdtscp, 0, vec![]),   // RDTSCP   — TSC + processor ID
+                _    => (Unknown(0x01), 0, vec![]),
+            }
+        }
 
         // ── CMOVcc ────────────────────────────────────────────────────────
         0x40..=0x4F => {

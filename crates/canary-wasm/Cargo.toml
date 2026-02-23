@@ -11,6 +11,7 @@ wasm-opt = false
 
 [dependencies]
 wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
 js-sys.workspace = true
 web-sys.workspace = true
 log.workspace = true
@@ -29,4 +30,5 @@ canary-jit      = { path = "../canary-jit" }
 canary-net      = { path = "../canary-net" }
 canary-input    = { path = "../canary-input" }
 canary-io       = { path = "../canary-io" }
+futures         = { version = "0.3", default-features = false, features = ["alloc"] }
 

@@ -235,6 +235,49 @@ impl MemFs {
 
     pub fn node(&self, ino: usize) -> &VNode { &self.nodes[ino] }
     pub fn node_mut(&mut self, ino: usize) -> &mut VNode { &mut self.nodes[ino] }
+
+    /// Merge all entries from `self` into `target` using target's public write API.
+    /// Existing entries in `target` are overwritten; new entries are created.
+    pub fn apply_to(&self, target: &mut MemFs) {
+        self.apply_node_to(0, "/", target);
+    }
+
+    fn apply_node_to(&self, ino: usize, path: &str, target: &mut MemFs) {
+        // Collect children first to avoid holding a borrow on self.nodes while recursing.
+        let children: Vec<(String, usize, FileKind)> = {
+            let node = self.node(ino);
+            node.children.iter()
+                .map(|(name, &child_ino)| (name.clone(), child_ino, self.node(child_ino).kind))
+                .collect()
+        };
+        for (name, child_ino, kind) in children {
+            if name.contains('/') || name.contains('\0') { continue; }
+            let child_path = if path == "/" {
+                format!("/{name}")
+            } else {
+                format!("{path}/{name}")
+            };
+            match kind {
+                FileKind::Directory => {
+                    target.mkdir_p(&child_path).ok();
+                    self.apply_node_to(child_ino, &child_path, target);
+                }
+                FileKind::Regular => {
+                    let content = self.node(child_ino).content.clone();
+                    target.write_file(&child_path, content).ok();
+                }
+                FileKind::Symlink => {
+                    if let Some(ref link_target) = self.node(child_ino).link_target {
+                        target.symlink(&child_path, link_target).ok();
+                    }
+                }
+                _ => {
+                    let content = self.node(child_ino).content.clone();
+                    target.write_file(&child_path, content).ok();
+                }
+            }
+        }
+    }
 }
 
 fn split_path(path: &str) -> (&str, &str) {
