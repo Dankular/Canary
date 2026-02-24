@@ -26,6 +26,7 @@ use wasm_encoder::{
 
 use crate::block::JitBlock;
 use canary_cpu::decoder::{Mnemonic, Operand};
+#[allow(unused_imports)]
 use canary_cpu::registers::reg;
 
 // ── Layout constants ─────────────────────────────────────────────────────────
@@ -225,26 +226,11 @@ fn emit_instr(
         }
 
         // ── PUSH reg ─────────────────────────────────────────────────────
-        Push if has_reg(&instr.operands, 0) => {
-            let src = reg_idx(&instr.operands[0]);
-
-            // RSP -= 8
-            load_reg(sink, reg::RSP);
-            sink.i64_const(8).i64_sub();
-            store_reg_from_stack(sink, reg::RSP);
-
-            // mem[RSP] = src  (i64 store at the new stack pointer)
-            // The address operand for WASM i64.store must be an i32.
-            load_reg(sink, reg::RSP);   // i64 — guest virtual address
-            sink.i32_wrap_i64();        // truncate to i32 (identity for 32-bit WASM address space)
-            load_reg(sink, src);        // value to store
-            sink.i64_store(MemArg {
-                offset: 0,
-                align: 3, // 8-byte aligned
-                memory_index: 0,
-            });
-            true
-        }
+        // Memory writes use guest virtual addresses that do not map
+        // directly to WASM linear memory offsets (there is a GuestMemory
+        // base offset).  Fall back to the Tier-0 interpreter for any
+        // block that contains memory-writing instructions.
+        Push => false,
 
         // ── SYSCALL: update RIP to instruction-after, signal exit_reason 1 ─
         // The actual RIP advance is done by the interpreter's Syscall handler;

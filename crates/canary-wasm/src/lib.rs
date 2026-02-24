@@ -14,6 +14,7 @@ use canary_cpu_arm64::{ArmCpuState,
 use canary_syscall::dispatch::{SyscallCtx, handle_syscall};
 use canary_elf::auxv::{build_auxv, build_initial_stack};
 use canary_jit::{JitCache, JitResult};
+use wasm_bindgen::JsCast;
 #[allow(unused_imports)]
 use canary_thread;
 
@@ -107,11 +108,15 @@ pub async fn fetch_ext2_file(path: String) -> Result<js_sys::Uint8Array, JsValue
 
 #[wasm_bindgen]
 pub struct CanaryRuntime {
-    cpu:     CpuState,
-    arm_cpu: Option<ArmCpuState>,
-    mem:     GuestMemory,
-    ctx:     SyscallCtx,
-    jit:     JitCache,
+    cpu:         CpuState,
+    arm_cpu:     Option<ArmCpuState>,
+    mem:         GuestMemory,
+    ctx:         SyscallCtx,
+    jit:         JitCache,
+    /// WASM bytes for blocks promoted to Tier-1; drained by JS each step.
+    pending_jit: Vec<(u64, Vec<u8>)>,
+    /// Compiled Tier-1 functions registered by JS after WebAssembly.Instance.
+    compiled_fns: std::collections::HashMap<u64, JsValue>,
 }
 
 #[wasm_bindgen]
@@ -121,11 +126,13 @@ impl CanaryRuntime {
     pub fn new() -> Self {
         console_error_panic_hook_init();
         CanaryRuntime {
-            cpu:     CpuState::default(),
-            arm_cpu: None,
-            mem:     GuestMemory::new(layout::TOTAL_WASM_BYTES),
-            ctx:     SyscallCtx::new(),
-            jit:     JitCache::new(),
+            cpu:          CpuState::default(),
+            arm_cpu:      None,
+            mem:          GuestMemory::new(layout::TOTAL_WASM_BYTES),
+            ctx:          SyscallCtx::new(),
+            jit:          JitCache::new(),
+            pending_jit:  Vec::new(),
+            compiled_fns: std::collections::HashMap::new(),
         }
     }
 
@@ -589,6 +596,49 @@ impl CanaryRuntime {
     pub fn push_mouse_move(&mut self, x: i32, y: i32) {
         self.ctx.input.mouse_move(x, y);
     }
+
+    /// Return the WASM linear memory so JS can instantiate compiled JIT blocks
+    /// with the correct memory import.
+    #[wasm_bindgen]
+    pub fn wasm_memory() -> JsValue {
+        wasm_bindgen::memory()
+    }
+
+    /// Drain all pending Tier-1 WASM compilations queued since the last call.
+    ///
+    /// Returns a JS Array of {rip, wasm: Uint8Array} objects.
+    /// Call this from the JS step loop, compile each entry with
+    /// new WebAssembly.Module(wasm), instantiate with wasm_memory as the
+    /// env.memory import, and register via register_compiled_block.
+    #[wasm_bindgen]
+    pub fn drain_jit_queue(&mut self) -> JsValue {
+        let arr = js_sys::Array::new();
+        for (rip, wasm_bytes) in self.pending_jit.drain(..) {
+            let obj = js_sys::Object::new();
+            js_sys::Reflect::set(
+                &obj, &"rip".into(),
+                &JsValue::from(rip as f64),
+            ).ok();
+            let wasm_arr = js_sys::Uint8Array::from(wasm_bytes.as_slice());
+            js_sys::Reflect::set(
+                &obj, &"wasm".into(), &wasm_arr.into(),
+            ).ok();
+            arr.push(&obj.into());
+        }
+        arr.into()
+    }
+
+    /// Register a compiled Tier-1 block function returned by JS after
+    /// WebAssembly.Instance.
+    ///
+    /// run_fn must be the run export of an instance created from the WASM
+    /// bytes emitted for rip.  It will be called as run(reg_ptr, 0) where
+    /// reg_ptr (i32) is the WASM linear memory offset of cpu.gpr[0].
+    /// Returns an i32 exit code: 0=continue, 1=syscall.
+    #[wasm_bindgen]
+    pub fn register_compiled_block(&mut self, rip: f64, run_fn: JsValue) {
+        self.compiled_fns.insert(rip as u64, run_fn);
+    }
 }
 
 // ── Error type ────────────────────────────────────────────────────────────────
@@ -814,10 +864,56 @@ impl CanaryRuntime {
         let rip = self.cpu.rip;
 
         // ── JIT cache lookup ──────────────────────────────────────────────
+        const TIER1_THRESHOLD: u32 = 16; // promote after 16 interpreter hits
+
         let block_hit = self.jit.get_mut(rip).is_some();
         if block_hit {
+            // Extract the info we need before borrowing self again.
+            let (should_try_promote, is_compiled, block_exit_rip) = {
+                let block = self.jit.get_mut(rip).unwrap();
+                block.hit_count = block.hit_count.saturating_add(1);
+                let promote = block.hit_count == TIER1_THRESHOLD
+                    && block.tier == canary_jit::JitTier::Interpreted;
+                (promote, block.tier == canary_jit::JitTier::Compiled, block.exit_rip)
+            };
+
+            if should_try_promote {
+                let block = self.jit.get_mut(rip).unwrap();
+                if let Some(wasm_bytes) = canary_jit::emitter::emit_block(block) {
+                    block.tier = canary_jit::JitTier::Compiled;
+                    self.pending_jit.push((rip, wasm_bytes));
+                }
+                // Fall through to Tier-0 for this iteration.
+            }
+
+            // Tier-1 execution (if JS has compiled this block)
+            if is_compiled {
+                if let Some(fn_val) = self.compiled_fns.get(&rip) {
+                    let fn_val = fn_val.clone();
+                    // reg_ptr: WASM linear memory address of cpu.gpr[0]
+                    let reg_ptr = self.cpu.gpr.as_ptr() as u32;
+                    let exit_code = js_sys::Reflect::apply(
+                        fn_val.unchecked_ref::<js_sys::Function>(),
+                        &JsValue::NULL,
+                        &js_sys::Array::of2(&JsValue::from(reg_ptr), &JsValue::from(0u32)),
+                    ).ok()
+                     .and_then(|v| v.as_f64())
+                     .map(|f| f as i32)
+                     .unwrap_or(0);
+                    // The compiled function modified cpu.gpr[] in place via the
+                    // shared WASM linear memory.  Update cpu.rip to the exit RIP.
+                    self.cpu.rip = block_exit_rip;
+                    return if exit_code == 1 {
+                        self.dispatch_syscall()
+                    } else {
+                        Ok(())
+                    };
+                }
+                // Not yet compiled by JS -- fall through to Tier-0.
+            }
+
+            // Tier-0: interpret the cached block
             let block = self.jit.get_mut(rip).unwrap();
-            block.hit_count += 1;
             let result = JitCache::execute_block(block, &mut self.cpu, &mut self.mem);
             return match result {
                 JitResult::Continue(_)  => Ok(()),

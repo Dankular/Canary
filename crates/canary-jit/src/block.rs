@@ -37,6 +37,12 @@ pub struct JitBlock {
     /// RET, SYSCALL, HLT, UD2) — there is no static fallthrough.
     pub fallthrough: Option<u64>,
 
+    /// RIP of the instruction immediately after the last instruction in
+    /// this block (i.e., where execution continues after the block, before
+    /// any branch resolution).  Used by the Tier-1 executor to update
+    /// `cpu.rip` without calling the interpreter.
+    pub exit_rip: u64,
+
     /// Number of times this block has been entered via the JIT cache.
     pub hit_count: u32,
 
@@ -150,6 +156,7 @@ pub fn compile_block(entry_rip: u64, mem: &GuestMemory) -> Option<JitBlock> {
         entry_rip,
         instrs,
         fallthrough,
+        exit_rip: rip,   // address of the instruction AFTER the last one decoded
         hit_count: 0,
         tier: JitTier::Interpreted,
     })

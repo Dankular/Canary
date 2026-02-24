@@ -773,21 +773,29 @@ pub fn handle_syscall(
             const FUTEX_WAKE_BITSET: u32 = 10;
 
             match op {
-                // ── WAIT / WAIT_BITSET ────────────────────────────────────
-                // In cooperative single-threaded mode we cannot truly block.
-                // Return EAGAIN so glibc's spin loop backs off and retries on
-                // the next scheduler slice; the JS step loop interleaves.
                 FUTEX_WAIT | FUTEX_WAIT_BITSET => {
                     let current = mem.read_i32(uaddr)
                         .map_err(|_| SyscallError::Fault(uaddr))?;
+                    // Value already changed — no need to sleep.
                     if current != val { return Ok(-EAGAIN); }
-                    -EAGAIN
+                    // In cooperative single-threaded mode we cannot truly
+                    // block.  Return EINTR ("interrupted while sleeping") so
+                    // that glibc retries the futex check on the next slice
+                    // rather than treating the failure as a hard error.
+                    // This is a valid POSIX spurious wakeup.
+                    -EINTR
                 }
 
-                // ── WAKE / WAKE_BITSET ────────────────────────────────────
-                // We don't track waiters in Rust; Atomics.notify() on the JS
-                // side handles Worker thread wakeups.
-                FUTEX_WAKE | FUTEX_WAKE_BITSET => 0,
+                // ── WAKE / WAKE_BITSET ────────────────────────────────────────────
+                // The JS side handles true Worker wakeups via Atomics.notify().
+                // Return the number of threads woken (1 max in cooperative mode).
+                FUTEX_WAKE | FUTEX_WAKE_BITSET => {
+                    let wake_count = a2 as i32; // val = max waiters to wake
+                    // We have no Rust-side waiter table; signal up to 1 waiter
+                    // woken so that callers relying on the return value (e.g.
+                    // pthread_cond_signal) behave correctly.
+                    if wake_count > 0 { 1 } else { 0 }
+                }
 
                 // ── REQUEUE (condition variable broadcast) ────────────────
                 FUTEX_REQUEUE => 0, // stub: no waiters to requeue
