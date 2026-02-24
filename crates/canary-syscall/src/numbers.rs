@@ -192,6 +192,10 @@ pub const AT_FDCWD:   i64 = -100;
 pub const TIOCGWINSZ: u64 = 0x5413;
 pub const TCGETS:     u64 = 0x5401;
 pub const TCSETS:     u64 = 0x5402;
+pub const TCSETSW:    u64 = 0x5403;
+pub const TCSETSF:    u64 = 0x5404;
+pub const TCXONC:     u64 = 0x540A;
+pub const TCFLSH:     u64 = 0x540B;
 
 // FUTEX operations
 pub const FUTEX_WAIT:          u64 = 0;

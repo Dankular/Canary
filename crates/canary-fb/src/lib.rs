@@ -18,6 +18,7 @@ pub const FBIOPAN_DISPLAY:     u64 = 0x4606;
 pub const FBIO_WAITFORVSYNC:   u64 = 0x40044620;
 pub const FBIOGET_CON2FBMAP:   u64 = 0x460f;
 pub const FBIOPUT_CON2FBMAP:   u64 = 0x4610;
+pub const FBIOBLANK:           u64 = 0x4611;
 
 /// fb_var_screeninfo (Linux kernel struct, 160 bytes).
 /// See linux/fb.h
@@ -209,6 +210,7 @@ impl Framebuffer {
             FBIOPAN_DISPLAY   => 0,  // pan = nop
             FBIO_WAITFORVSYNC => 0,  // vsync = instant
             FBIOGET_CON2FBMAP | FBIOPUT_CON2FBMAP => 0,
+            FBIOBLANK => 0,  // blank/unblank — no-op (display is always on)
             _ => -25, // ENOTTY
         }
     }

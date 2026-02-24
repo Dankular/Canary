@@ -89,8 +89,27 @@ pub fn handle_socket_syscall(
 
             if !net.socks.is_socket(fd) { return EBADF; }
 
-            // Read sockaddr_in: family(u16) + port(u16 BE) + addr(u32) = 8 bytes
             let family = match mem.read_u16(addr_ptr) { Ok(v) => v, Err(_) => return EINVAL };
+
+            if family == 1 {
+                // AF_UNIX: sockaddr_un = family(u16) + path(up to 108 bytes, null-terminated)
+                let path_bytes = match mem.read_bytes(addr_ptr + 2, 108) {
+                    Ok(b) => b.to_vec(),
+                    Err(_) => return EINVAL,
+                };
+                let path_end = path_bytes.iter().position(|&b| b == 0).unwrap_or(108);
+                let path = match std::str::from_utf8(&path_bytes[..path_end]) {
+                    Ok(s) => s.to_string(),
+                    Err(_) => return EINVAL,
+                };
+                if let Some(sock) = net.socks.get_mut(fd) {
+                    sock.state = SocketState::Bound { addr: [0u8; 16], port: 0 };
+                }
+                net.unix_paths.insert(path, fd);
+                net.unix_accept_queue.entry(fd).or_default();
+                return 0;
+            }
+
             let port_be = match mem.read_u16(addr_ptr + 2) { Ok(v) => v, Err(_) => return EINVAL };
             let port = u16::from_be(port_be);
 
@@ -133,6 +152,55 @@ pub fn handle_socket_syscall(
             if !net.socks.is_socket(fd) { return EBADF; }
 
             let family = match mem.read_u16(addr_ptr) { Ok(v) => v, Err(_) => return EINVAL };
+
+            if family == 1 {
+                // AF_UNIX: read the path from sockaddr_un
+                let path_bytes = match mem.read_bytes(addr_ptr + 2, 108) {
+                    Ok(b) => b.to_vec(),
+                    Err(_) => return EINVAL,
+                };
+                let path_end = path_bytes.iter().position(|&b| b == 0).unwrap_or(108);
+                let path = match std::str::from_utf8(&path_bytes[..path_end]) {
+                    Ok(s) => s.to_string(),
+                    Err(_) => return EINVAL,
+                };
+
+                // Find the listening server socket.
+                let server_fd = match net.unix_paths.get(&path).copied() {
+                    Some(sfd) => sfd,
+                    None      => return ECONNREFUSED,
+                };
+
+                // Determine client socket's domain/type for the peer.
+                let (domain, socktype, nonblock) = match net.socks.get(fd) {
+                    Some(s) => (s.domain, s.socktype, s.nonblock),
+                    None    => return EBADF,
+                };
+
+                // Allocate a peer socket for the server side of this connection.
+                let peer_fd = net.next_sock_fd;
+                net.next_sock_fd += 1;
+
+                let mut peer = Socket::new(domain, socktype, nonblock);
+                peer.state     = SocketState::Connected;
+                peer.unix_peer = Some(fd);
+                net.socks.insert(peer_fd, peer);
+
+                // Link client to its peer.
+                if let Some(sock) = net.socks.get_mut(fd) {
+                    sock.state     = SocketState::Connected;
+                    sock.unix_peer = Some(peer_fd);
+                }
+
+                // Enqueue the peer fd for the server's accept() call.
+                net.unix_accept_queue
+                    .entry(server_fd)
+                    .or_default()
+                    .push_back(peer_fd);
+
+                return 0;
+            }
+
             let port_be = match mem.read_u16(addr_ptr + 2) { Ok(v) => v, Err(_) => return EINVAL };
             let port = u16::from_be(port_be);
 
@@ -143,7 +211,6 @@ pub fn handle_socket_syscall(
                     Err(_) => return EINVAL,
                 }
             } else {
-                // For non-IPv4 (AF_UNIX, AF_INET6, etc.) — use zeroed placeholder.
                 [0, 0, 0, 0]
             };
 
@@ -154,16 +221,30 @@ pub fn handle_socket_syscall(
             }
 
             net.pending_connect.push(PendingConnect { fd, ip, port });
-            // Return 0 (success) — for blocking sockets we pretend the connect
-            // completed immediately; JS will call socket_connected() later.
             0
         }
 
         // ── accept(fd, addr_ptr, addrlen_ptr) ─────────────────────────────
         SYS_ACCEPT | SYS_ACCEPT4 => {
-            let fd = a0;
+            let fd          = a0;
+            let addr_ptr    = a1;
+            let addrlen_ptr = a2;
+
             if !net.socks.is_socket(fd) { return EBADF; }
-            // No incoming connections in this implementation yet.
+
+            // AF_UNIX: dequeue from in-memory accept queue.
+            if let Some(peer_fd) = net.unix_accept_queue
+                .get_mut(&fd)
+                .and_then(|q| q.pop_front())
+            {
+                // Optionally write peer address (abstract/unnamed — all zeros).
+                if addr_ptr != 0 {
+                    mem.write_u16(addr_ptr, 1).ok(); // AF_UNIX
+                    if addrlen_ptr != 0 { mem.write_u32(addrlen_ptr, 2).ok(); }
+                }
+                return peer_fd as i64;
+            }
+
             EAGAIN
         }
 
@@ -183,6 +264,18 @@ pub fn handle_socket_syscall(
                 Err(_) => return EINVAL,
             };
 
+            // AF_UNIX: route directly to peer socket's recv_buf (no JS round-trip).
+            let peer_fd = net.socks.get(fd).and_then(|s| s.unix_peer);
+            if let Some(pfd) = peer_fd {
+                if let Some(sock) = net.socks.get(fd) {
+                    if sock.state == SocketState::Closed { return EPIPE; }
+                }
+                if let Some(peer) = net.socks.get_mut(pfd) {
+                    peer.recv_buf.extend(data.iter().copied());
+                }
+                return len as i64;
+            }
+
             if let Some(sock) = net.socks.get_mut(fd) {
                 if sock.state == SocketState::Closed { return EPIPE; }
                 sock.send_buf.extend(data.iter().copied());
@@ -197,14 +290,13 @@ pub fn handle_socket_syscall(
         SYS_SENDMSG => {
             let fd       = a0;
             let msg_ptr  = a1;
-            // struct msghdr layout (x86-64):
-            //   msg_name (u64), msg_namelen (u32), pad (u32)
-            //   msg_iov  (u64), msg_iovlen  (u64)
-            //   ...
             if !net.socks.is_socket(fd) { return EBADF; }
 
-            let iov_ptr = match mem.read_u64(msg_ptr + 8) { Ok(v) => v, Err(_) => return EINVAL };
+            let iov_ptr = match mem.read_u64(msg_ptr + 8)  { Ok(v) => v, Err(_) => return EINVAL };
             let iovlen  = match mem.read_u64(msg_ptr + 16) { Ok(v) => v, Err(_) => return EINVAL };
+
+            // Determine if this is a AF_UNIX socket with a peer (in-memory routing).
+            let peer_fd = net.socks.get(fd).and_then(|s| s.unix_peer);
 
             let mut total_sent: i64 = 0;
             for i in 0..iovlen {
@@ -214,10 +306,17 @@ pub fn handle_socket_syscall(
                     Ok(b)  => b.to_vec(),
                     Err(_) => return EINVAL,
                 };
-                if let Some(sock) = net.socks.get_mut(fd) {
-                    sock.send_buf.extend(chunk.iter().copied());
+                if let Some(pfd) = peer_fd {
+                    // AF_UNIX: push directly into peer recv_buf.
+                    if let Some(peer) = net.socks.get_mut(pfd) {
+                        peer.recv_buf.extend(chunk.iter().copied());
+                    }
+                } else {
+                    if let Some(sock) = net.socks.get_mut(fd) {
+                        sock.send_buf.extend(chunk.iter().copied());
+                    }
+                    net.pending_sends.push(PendingSend { fd, data: chunk });
                 }
-                net.pending_sends.push(PendingSend { fd, data: chunk });
                 total_sent += iov_len as i64;
             }
             total_sent

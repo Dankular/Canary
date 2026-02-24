@@ -77,6 +77,8 @@ pub struct Socket {
     pub nonblock: bool,
     /// Remote address for connected sockets: (ipv4_bytes[4], port).
     pub peer:     Option<([u8; 4], u16)>,
+    /// For AF_UNIX connected sockets: the fd of the other end.
+    pub unix_peer: Option<u64>,
 }
 
 impl Socket {
@@ -89,6 +91,7 @@ impl Socket {
             send_buf: VecDeque::new(),
             nonblock,
             peer:     None,
+            unix_peer: None,
         }
     }
 }
@@ -160,6 +163,10 @@ pub struct NetCtx {
     pub pending_connect: Vec<PendingConnect>,
     /// send_buf data waiting for JS to forward.
     pub pending_sends:   Vec<PendingSend>,
+    /// AF_UNIX: path → listening server fd.
+    pub unix_paths:        HashMap<String, u64>,
+    /// AF_UNIX: listening server fd → queue of incoming peer fds for accept().
+    pub unix_accept_queue: HashMap<u64, std::collections::VecDeque<u64>>,
 }
 
 impl NetCtx {
@@ -169,6 +176,8 @@ impl NetCtx {
             next_sock_fd:    100,
             pending_connect: Vec::new(),
             pending_sends:   Vec::new(),
+            unix_paths:        HashMap::new(),
+            unix_accept_queue: HashMap::new(),
         }
     }
 }

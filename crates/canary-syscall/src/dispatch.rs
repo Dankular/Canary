@@ -748,7 +748,11 @@ pub fn handle_syscall(
                         mem.write_u16(ioctl_arg + 6,   0)?;
                         0
                     }
-                    TCGETS | TCSETS => 0,
+                    TCGETS | TCSETS | TCSETSW | TCSETSF | TCFLSH | TCXONC => 0,
+                    // VT / console ioctls — Xorg fbdev driver calls these;
+                    // we stub them all as success so Xorg doesn't abort.
+                    0x5600..=0x5699 => 0,  // VT_* range
+                    0x4B00..=0x4BFF => 0,  // KD_* range (KDSETMODE, KDGKBMODE, ...)
                     _ => -EINVAL,
                 }
             }
@@ -1245,8 +1249,12 @@ pub fn handle_syscall(
             new_tid as i64
         }
 
-        // ── fork (not supported — use clone instead) ──────────────────────
-        SYS_FORK => -ENOSYS,
+        // ── fork ──────────────────────────────────────────────────────────
+        // True process forking (separate address space) is not supported in
+        // a WASM sandbox.  Return -EPERM so that Wine's ntdll falls back to
+        // connecting to an already-running wineserver socket rather than
+        // aborting with "syscall not implemented".
+        SYS_FORK => -EPERM,
 
         // ── execve(pathname, argv, envp) ──────────────────────────────────
         SYS_EXECVE => {
