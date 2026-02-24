@@ -73,6 +73,20 @@ pub fn add_flags(rflags: &mut u64, a: u64, b: u64, carry_in: u64, width: u8) -> 
 }
 
 /// Compute CF and OF for subtraction: `a - b (- borrow_in)`.
+/// CF = 1 when unsigned borrow occurs (a < b + borrow_in).
 pub fn sub_flags(rflags: &mut u64, a: u64, b: u64, borrow_in: u64, width: u8) -> u64 {
-    add_flags(rflags, a, (!b & mask_for(width)).wrapping_add(1 - borrow_in), 0, width)
+    let mask   = mask_for(width);
+    let a_m    = a & mask;
+    let b_m    = b & mask;
+    let result = a_m.wrapping_sub(b_m).wrapping_sub(borrow_in) & mask;
+    // CF: unsigned borrow (x86 CF=1 when a < b + borrow_in).
+    let cf = (a_m as u128) < (b_m as u128) + (borrow_in as u128);
+    // OF: signed overflow in subtraction.
+    let sign = 1u64 << (width - 1);
+    let of   = ((a_m ^ b_m) & (a_m ^ result)) & sign != 0;
+    set_flag(rflags, CF, cf);
+    set_flag(rflags, OF, of);
+    update_szp(rflags, result, width);
+    set_flag(rflags, AF, (a_m ^ b_m ^ result) & 0x10 != 0);
+    result
 }

@@ -288,6 +288,26 @@ impl CanaryRuntime {
         if let Some(ref a) = self.arm_cpu { a.pc } else { self.cpu.rip }
     }
 
+    /// Read a 64-bit little-endian value from guest memory (for debugging).
+    /// Returns 0 if the address is not mapped.
+    #[wasm_bindgen]
+    pub fn read_mem_u64(&self, addr: u64) -> u64 {
+        self.mem.read_u64(addr).unwrap_or(0)
+    }
+
+    /// Return the current FS segment base (TLS pointer) for debugging.
+    #[wasm_bindgen]
+    pub fn get_fs_base(&self) -> u64 {
+        self.cpu.fs_base
+    }
+
+    /// Write a 64-bit little-endian value to guest memory (for debugging/patching).
+    /// Returns true on success, false if the address is not mapped.
+    #[wasm_bindgen]
+    pub fn write_mem_u64(&mut self, addr: u64, val: u64) -> bool {
+        self.mem.write_u64(addr, val).is_ok()
+    }
+
     /// Return a JSON object with all GPR values (for debugging).
     #[wasm_bindgen]
     pub fn dump_regs_json(&self) -> String {
@@ -637,6 +657,22 @@ impl CanaryRuntime {
 
         // ── 4. Map + load PT_LOAD segments for main ELF ───────────────────
         self.load_elf_segments(data, &elf)?;
+        // Linux places the program break (brk heap) immediately after the
+        // end of the main ELF's highest loaded segment (the BSS end).
+        // Setting program_brk here ensures the brk heap is well below the
+        // mmap region (MMAP_START = 0x20000000) and prevents the two regions
+        // from colliding.
+        let bss_end = elf.load_segs.iter()
+            .map(|s| {
+                let map_start = s.vaddr & !0xFFF_u64;
+                let map_size  = (s.vaddr - map_start + s.memsz + 0xFFF_u64) & !0xFFF_u64;
+                map_start + map_size
+            })
+            .max()
+            .unwrap_or(layout::MMAP_START);
+        if bss_end < layout::MMAP_START {
+            self.mem.program_brk = bss_end;
+        }
 
         // ── 5. Optionally load the dynamic interpreter ─────────────────────
         let (interp_base, interp_entry) = if let Some(ref interp_path) = elf.interp {
@@ -1226,9 +1262,32 @@ impl CanaryRuntime {
     }
 }
 
-// ── panic hook ────────────────────────────────────────────────────────────────
+// ── Logger + panic hook ───────────────────────────────────────────────────────
 
-fn console_error_panic_hook_init() {}
+/// Minimal logger that forwards `log::error!` / `log::warn!` to the browser
+/// DevTools console.  Uses the JS `console.error` / `console.warn` bindings
+/// already declared at the top of this file.
+struct ConsoleLogger;
+
+impl log::Log for ConsoleLogger {
+    fn enabled(&self, _: &log::Metadata) -> bool { true }
+    fn log(&self, record: &log::Record) {
+        let msg = format!("[canary {}] {}", record.level(), record.args());
+        match record.level() {
+            log::Level::Error | log::Level::Warn => error(&msg),
+            _                                    => log(&msg),
+        }
+    }
+    fn flush(&self) {}
+}
+
+static CONSOLE_LOGGER: ConsoleLogger = ConsoleLogger;
+
+fn console_error_panic_hook_init() {
+    // Register the console logger once; ignore errors if already registered.
+    let _ = log::set_logger(&CONSOLE_LOGGER);
+    log::set_max_level(log::LevelFilter::Warn);
+}
 
 // ── AArch64 → x86-64 syscall number translation ───────────────────────────────
 //

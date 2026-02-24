@@ -233,7 +233,8 @@ impl GuestMemory {
             self.munmap(guest_hint, length).ok();
             guest_hint
         } else {
-            let addr = page_align_up(self.mmap_brk);
+            // Ensure the mmap region never overlaps with the brk heap.
+            let addr = page_align_up(self.mmap_brk.max(self.program_brk));
             self.mmap_brk = addr + length;
             addr
         };
@@ -271,13 +272,37 @@ impl GuestMemory {
             self.page_table.remove(&((guest_start >> 12) + i));
         }
 
-        // Remove mapping records that overlap [guest_start, guest_end).
+        // Remove/split mapping records that overlap [guest_start, guest_end).
+        // Linux semantics: a partial unmap splits the record; head and tail
+        // fragments outside the unmapped range are preserved.
         let keys: Vec<u64> = self.mappings
             .range(..guest_end)
             .filter(|(_, m)| m.guest_start + m.length > guest_start)
             .map(|(k, _)| *k)
             .collect();
-        for k in keys { self.mappings.remove(&k); }
+        for k in keys {
+            let m = self.mappings.remove(&k).unwrap();
+            let m_start = m.guest_start;
+            let m_end   = m.guest_start + m.length;
+            // Preserve the part before the unmapped range, if any.
+            if m_start < guest_start {
+                self.mappings.insert(m_start, Mapping {
+                    guest_start: m_start,
+                    length:      guest_start - m_start,
+                    prot:        m.prot,
+                    wasm_offset: 0,
+                });
+            }
+            // Preserve the part after the unmapped range, if any.
+            if m_end > guest_end {
+                self.mappings.insert(guest_end, Mapping {
+                    guest_start: guest_end,
+                    length:      m_end - guest_end,
+                    prot:        m.prot,
+                    wasm_offset: 0,
+                });
+            }
+        }
 
         Ok(())
     }
@@ -411,9 +436,14 @@ impl GuestMemory {
             let start_page = old_brk >> 12;
             let end_page   = new_brk >> 12;
             for page in start_page..end_page {
-                let frame = self.get_or_alloc_frame(page);
-                let idx = frame as usize * PAGE_SIZE as usize;
-                self.data[idx..idx + PAGE_SIZE as usize].fill(0);
+                // Only zero-allocate pages not already present from a prior mmap.
+                // Zeroing an existing mmap'd page would destroy loaded library data.
+                if !self.page_table.contains_key(&page) {
+                    let frame = self.alloc_frame();
+                    self.page_table.insert(page, frame);
+                    let idx = frame as usize * PAGE_SIZE as usize;
+                    self.data[idx..idx + PAGE_SIZE as usize].fill(0);
+                }
             }
             self.program_brk = new_brk;
         }

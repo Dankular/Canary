@@ -50,20 +50,17 @@ pub fn build_auxv(
 ) -> Vec<AuxEntry> {
     use at::*;
 
-    // x86-64 hwcap bits: fpu, sse, sse2 (the baseline for x86-64)
+    // x86-64 hwcap bits — must match the CPUID EDX bits returned by the
+    // interpreter (canary-cpu/src/interpreter.rs emulate_cpuid leaf 1).
+    // SSE, SSE2, MMX, FXSR intentionally excluded: CPUID reports them as
+    // absent so that glibc picks scalar code paths rather than SSE2 loops
+    // that Canary has not yet fully validated.
     const HWCAP: u64 = (1 << 0)  // FPU
-                     | (1 << 3)  // DE
                      | (1 << 4)  // TSC
                      | (1 << 6)  // PAE
                      | (1 << 8)  // CX8
-                     | (1 << 9)  // APIC
-                     | (1 << 11) // SEP
-                     | (1 << 12) // MTRR
                      | (1 << 15) // CMOV
-                     | (1 << 23) // MMX
-                     | (1 << 24) // FXSR
-                     | (1 << 25) // SSE
-                     | (1 << 26) // SSE2
+                     | (1 << 19) // CLFSH
                      ;
 
     vec![

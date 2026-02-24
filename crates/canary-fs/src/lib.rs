@@ -178,6 +178,7 @@ impl MemFs {
                     // We'd need parent tracking for this; for now stay put.
                 }
                 name => {
+                    let parent = current; // parent directory inode (before stepping into child)
                     current = *node.children.get(name)
                         .ok_or_else(|| FsError::NotFound(name.to_string()))?;
                     // Follow symlinks.
@@ -185,7 +186,16 @@ impl MemFs {
                         *followed += 1;
                         if *followed > 40 { return Err(FsError::Io("symlink loop".into())); }
                         let target = self.nodes[current].link_target.clone().unwrap();
-                        current = self.lookup(&target)?;
+                        current = if target.starts_with('/') {
+                            // Absolute symlink: resolve from filesystem root.
+                            self.lookup(&target)?
+                        } else {
+                            // Relative symlink: resolve relative to the parent directory.
+                            let target_parts: Vec<&str> = target.split('/')
+                                .filter(|s| !s.is_empty())
+                                .collect();
+                            self.lookup_from(parent, &target_parts, followed)?
+                        };
                     }
                 }
             }

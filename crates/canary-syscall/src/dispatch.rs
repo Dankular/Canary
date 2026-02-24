@@ -373,7 +373,7 @@ pub fn handle_syscall(
         }
 
         // ── stat/fstat/lstat ──────────────────────────────────────────────
-        SYS_STAT | SYS_LSTAT => {
+        SYS_STAT => {
             let path = mem.read_cstr(a0)?;
             let abs  = resolve_path(&ctx.cwd, &path);
             match ctx.vfs.mem.lookup(&abs) {
@@ -382,6 +382,30 @@ pub fn handle_syscall(
                     0
                 }
                 Err(_) => -ENOENT,
+            }
+        }
+        SYS_LSTAT => {
+            // lstat must NOT follow the final symlink component.
+            let path = mem.read_cstr(a0)?;
+            let abs  = resolve_path(&ctx.cwd, &path);
+            let ino_result = {
+                let (par, nam) = match abs.rfind('/') {
+                    None      => ("/", abs.as_str()),
+                    Some(0)   => ("/", &abs[1..]),
+                    Some(pos) => (&abs[..pos], &abs[pos+1..]),
+                };
+                ctx.vfs.mem.lookup(par)
+                    .ok()
+                    .and_then(|parent_ino| {
+                        ctx.vfs.mem.node(parent_ino).children.get(nam).copied()
+                    })
+            };
+            match ino_result {
+                Some(ino) => {
+                    write_stat(mem, a1, ctx.vfs.mem.node(ino).stat.clone())?;
+                    0
+                }
+                None => -ENOENT,
             }
         }
         SYS_FSTAT => {
@@ -599,16 +623,35 @@ pub fn handle_syscall(
                 if n > 0 { mem.write_bytes_at(buf_ptr, &exe[..n])?; }
                 return Ok(n as i64);
             }
-            match ctx.vfs.mem.lookup(&abs) {
-                Ok(ino) => {
-                    if let Some(target) = &ctx.vfs.mem.node(ino).link_target {
-                        let bytes = target.as_bytes();
-                        let n = bytes.len().min(buf_sz);
-                        mem.write_bytes_at(buf_ptr, &bytes[..n])?;
-                        n as i64
-                    } else { -EINVAL }
+            // Look up the PARENT dir (symlinks in the middle are followed),
+            // then inspect the final component WITHOUT following it.
+            let link_target: Option<String> = {
+                let (par, nam) = match abs.rfind('/') {
+                    None      => ("/", abs.as_str()),
+                    Some(0)   => ("/", &abs[1..]),
+                    Some(pos) => (&abs[..pos], &abs[pos+1..]),
+                };
+                ctx.vfs.mem.lookup(par)
+                    .ok()
+                    .and_then(|parent_ino| {
+                        ctx.vfs.mem.node(parent_ino).children.get(nam).copied()
+                    })
+                    .and_then(|child_ino| {
+                        ctx.vfs.mem.node(child_ino).link_target.clone()
+                    })
+            };
+            match link_target {
+                Some(target) => {
+                    let bytes = target.as_bytes();
+                    let n = bytes.len().min(buf_sz);
+                    if n > 0 { mem.write_bytes_at(buf_ptr, &bytes[..n])?; }
+                    n as i64
                 }
-                Err(_) => -ENOENT,
+                None => {
+                    // Path exists but is not a symlink → EINVAL; not found → ENOENT.
+                    let exists = ctx.vfs.mem.lookup(&abs).is_ok();
+                    if exists { -EINVAL } else { -ENOENT }
+                }
             }
         }
 

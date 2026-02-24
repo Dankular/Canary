@@ -128,7 +128,7 @@ pub enum Operand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mnemonic {
     // Data movement
-    Mov, Movsx, Movzx, Movs, Movaps, Movups, Movsd, Movss,
+    Mov, Movsx, Movzx, Movsxd, Movs, Movaps, Movups, Movsd, Movss,
     Lea, Push, Pop, Xchg, Xadd,
     // Arithmetic
     Add, Adc, Sub, Sbb, Imul, Mul, Idiv, Div, Inc, Dec, Neg, Not,
@@ -147,7 +147,7 @@ pub enum Mnemonic {
     Clc, Stc, Cld, Std, Cli, Sti, Cmc,
     Lahf, Sahf, Pushf, Popf,
     // Misc
-    Nop, Hlt, Cpuid, Rdtsc, Rdtscp, Xgetbv,
+    Nop, Hlt, Cpuid, Rdtsc, Rdtscp, Xgetbv, Enter, Leave,
     // Conditionals
     Setcc(u8), Cmovcc(u8),
     // Cmpxchg / atomics
@@ -157,8 +157,9 @@ pub enum Mnemonic {
     Addsd, Subsd, Mulsd, Divsd, Sqrtsd, Ucomisd, Cvtsi2sd, Cvttsd2si,
     Addss, Subss, Mulss, Divss, Sqrtss, Ucomiss, Cvtsi2ss, Cvttss2si,
     Pxor, Pand, Por, Pandn, Pcmpeqb, Pcmpeqd,
-    Movdqu, Movdqa, Movq,
-    Punpcklqdq, Punpckhqdq,
+    Movdqu, Movdqa, Movq, Movd, Movhps,
+    Punpcklqdq, Punpckhqdq, Punpcklbw, Punpcklwd,
+    Pmovmskb, Pshufd,
     // x87
     Fld, Fstp, Faddp, Fsubp, Fmulp, Fdivp, Fcompp,
     // Sign-extension
@@ -232,15 +233,22 @@ fn decode_mem(reader: &mut ByteReader, modrm: ModRm, pfx: &Prefixes, _rip_after:
     if modrm.mod_ == 3 { panic!("decode_mem called with mod=3"); }
 
     // SIB present when rm==4 and mod!=3.
-    let (base_reg, index_reg, scale) = if modrm.rm == 4 {
+    // sib_no_base: true when mod=0 and SIB.base=5 → no base register, disp32 follows.
+    let (base_reg, index_reg, scale, sib_no_base) = if modrm.rm == 4 {
         let sib = Sib::from_byte(reader.read()?);
-        let base  = Some(sib.base  as usize | ((rex_b as usize) << 3));
+        // x86-64: SIB.base=5 with mod=0 means "no base register, disp32 displacement".
+        let no_base = modrm.mod_ == 0 && sib.base == 5;
+        let base = if no_base {
+            None
+        } else {
+            Some(sib.base as usize | ((rex_b as usize) << 3))
+        };
         let index = if sib.index == 4 { None } else { Some(sib.index as usize | ((rex_x as usize) << 3)) };
         let scale = 1u8 << sib.scale;
-        (base, index, scale)
+        (base, index, scale, no_base)
     } else {
         let rm = modrm.rm_ext(rex_b);
-        (Some(rm), None, 1)
+        (Some(rm), None, 1, false)
     };
 
     // RIP-relative addressing (mod=0, rm=5, no SIB).
@@ -248,6 +256,8 @@ fn decode_mem(reader: &mut ByteReader, modrm: ModRm, pfx: &Prefixes, _rip_after:
 
     let disp = match modrm.mod_ {
         0 if rip_relative => reader.read_i32()? as i64,
+        // SIB.base=5 with mod=0: no base register, mandatory 32-bit displacement.
+        0 if sib_no_base  => reader.read_i32()? as i64,
         0 => 0i64,
         1 => reader.read_i8()? as i64,
         2 => reader.read_i32()? as i64,
@@ -382,6 +392,16 @@ fn decode_opcode(
             (Pop, 64, vec![Reg(reg)])
         }
 
+        // ── MOVSXD r64/r32, r/m32 (opcode 0x63, 64-bit mode) ─────────────
+        // In 64-bit mode 0x63 is always MOVSXD (ARPL is invalid).
+        // REX.W=1 → sign-extend r/m32 → r64; REX.W=0 → move r/m32 → r32.
+        0x63 => {
+            let (modrm, mem) = decode_modrm_with_mem(r, pfx, rip_approx)?;
+            let src = mem.unwrap_or_else(|| Reg(modrm.rm_ext(pfx.rex_b())));
+            let dst = Reg(modrm.reg_ext(pfx.rex_r()));
+            (Movsxd, op_size, vec![dst, src])
+        }
+
         // ── PUSH imm ──────────────────────────────────────────────────────
         0x68 => {
             let imm = r.read_i32()? as i64;
@@ -485,6 +505,10 @@ fn decode_opcode(
         0x3C => { let imm = r.read_i8()? as i64; (Cmp, 8, vec![Reg(0), Imm(imm)]) }
         0x3D => { let imm = r.read_i32()? as i64; (Cmp, op_size, vec![Reg(0), Imm(imm)]) }
 
+        // ── XCHG r/m, r (ModRM form) ─────────────────────────────────────
+        0x86 => { rm_reg!(Xchg, 8) }
+        0x87 => { rm_reg!(Xchg, op_size) }
+
         // ── TEST ─────────────────────────────────────────────────────────
         0x84 => { rm_reg!(Test, 8)  }
         0x85 => { rm_reg!(Test, op_size) }
@@ -532,22 +556,28 @@ fn decode_opcode(
             let rel = r.read_i32()? as i64;
             (Jmp, 0, vec![Imm(rel)])
         }
+        // ── INC/DEC r/m8 (Group 4) ───────────────────────────────────────
+        0xFE => {
+            let (modrm, mem) = decode_modrm_with_mem(r, pfx, rip_approx)?;
+            let dst = mem.unwrap_or_else(|| Reg(modrm.rm_ext(pfx.rex_b())));
+            match modrm.reg {
+                0 => (Inc, 8, vec![dst]), // INC r/m8
+                1 => (Dec, 8, vec![dst]), // DEC r/m8
+                _ => (Unknown(opcode), 0, vec![]),
+            }
+        }
         // ── JMP r/m64 ─────────────────────────────────────────────────────
         0xFF => {
             let (modrm, mem) = decode_modrm_with_mem(r, pfx, rip_approx)?;
             let dst = mem.unwrap_or_else(|| Reg(modrm.rm_ext(pfx.rex_b())));
             match modrm.reg {
-                0 => { let (modrm2, mem2) = decode_modrm_with_mem(r, pfx, rip_approx)?;
-                       let d2 = mem2.unwrap_or_else(|| Reg(modrm2.rm_ext(pfx.rex_b())));
-                       (Inc, op_size, vec![d2]) }
-                1 => { let (modrm2, mem2) = decode_modrm_with_mem(r, pfx, rip_approx)?;
-                       let d2 = mem2.unwrap_or_else(|| Reg(modrm2.rm_ext(pfx.rex_b())));
-                       (Dec, op_size, vec![d2]) }
-                2 => (Jmp,  0, vec![dst]),
-                3 => (Jmp,  0, vec![dst]), // far jmp (unsupported)
-                4 => (Call, 0, vec![dst]),
-                5 => (Call, 0, vec![dst]), // far call
-                6 => (Push, 64, vec![dst]),
+                0 => (Inc,  op_size, vec![dst]), // INC r/m
+                1 => (Dec,  op_size, vec![dst]), // DEC r/m
+                2 => (Call, 0,       vec![dst]), // FF /2 = CALL r/m64 (near indirect)
+                3 => (Call, 0,       vec![dst]), // FF /3 = CALL m64  (far, treat as near)
+                4 => (Jmp,  0,       vec![dst]), // FF /4 = JMP  r/m64 (near indirect)
+                5 => (Jmp,  0,       vec![dst]), // FF /5 = JMP  m64  (far, treat as near)
+                6 => (Push, 64,      vec![dst]),
                 _ => (Unknown(opcode), 0, vec![]),
             }
         }
@@ -584,6 +614,14 @@ fn decode_opcode(
         0x98 => (Cwde, op_size, vec![]), // CBW / CWDE / CDQE
         0x99 => (Cdq,  op_size, vec![]), // CWD / CDQ / CQO
 
+        // ── ENTER / LEAVE ─────────────────────────────────────────────────
+        0xC8 => {
+            let alloc = r.read_u16()? as i64;
+            let level = r.read()? as i64;
+            (Enter, 0, vec![Imm(alloc), Imm(level)])
+        }
+        0xC9 => (Leave, 0, vec![]),
+
         // ── INT3 / INT ────────────────────────────────────────────────────
         0xCC => (Int3, 0, vec![]),
         0xCD => { let n = r.read_i8()? as i64; (Int, 0, vec![Imm(n)]) }
@@ -619,7 +657,8 @@ fn decode_opcode(
             let (modrm, mem) = decode_modrm_with_mem(r, pfx, rip_approx)?;
             let src = mem.unwrap_or_else(|| Reg(modrm.rm_ext(pfx.rex_b())));
             let mn = match modrm.reg {
-                0 | 1 => { let imm = read_imm(r, sz)?; return Ok((Test, sz, vec![src, Imm(imm)])); }
+                // TEST r/m, Iz: in 64-bit mode the immediate is 32-bit sign-extended (not 64-bit).
+                0 | 1 => { let imm = read_imm(r, sz.min(32))?; return Ok((Test, sz, vec![src, Imm(imm)])); }
                 2 => Not,
                 3 => Neg,
                 4 => Mul,
@@ -715,6 +754,36 @@ fn decode_2byte(r: &mut ByteReader, op: u8, pfx: &Prefixes, op_size: u8, _rip: u
         0x31 => (Rdtsc,   0, vec![]),
         0xA2 => (Cpuid,   0, vec![]),
 
+        // ── 0F 1E: ENDBR64 / ENDBR32 / multi-byte NOP ────────────────────
+        // F3 0F 1E FB = ENDBR64  (CET/IBT landing-pad marker, always a NOP in ring-3)
+        // F3 0F 1E FA = ENDBR32
+        // 0F 1E /r   = NOPW (various padding variants)
+        // All consume one ModRM byte (+ optional SIB/displacement) and are NOPs.
+        0x1E => {
+            let _ = decode_modrm_with_mem(r, pfx, 0)?;
+            (Nop, 0, vec![])
+        }
+
+        // ── 0F 1F: NOP Ev (multi-byte alignment NOPs) ─────────────────────
+        // 0F 1F 00             = NOP [rax]
+        // 0F 1F 40 00          = NOP [rax+0]
+        // 0F 1F 44 00 00       = NOP [rax+rax*1+0]
+        // 0F 1F 80 00 00 00 00 = NOP [rax+0x0]     etc.
+        0x1F => {
+            let _ = decode_modrm_with_mem(r, pfx, 0)?;
+            (Nop, 0, vec![])
+        }
+
+        // ── 0F AE group — FP/SSE state + memory barriers ─────────────────
+        // Covers FXSAVE/FXRSTOR, LDMXCSR/STMXCSR, XSAVE/XRSTOR,
+        // LFENCE (0F AE E8), MFENCE (0F AE F0), SFENCE (0F AE F8), CLFLUSH.
+        // All treated as Nop for now; decode_modrm_with_mem consumes the
+        // ModRM byte plus any SIB/displacement so the reader stays in sync.
+        0xAE => {
+            let _ = decode_modrm_with_mem(r, pfx, 0)?;
+            (Nop, 0, vec![])
+        }
+
         // ── 0F 01 group — system instructions with ModRM/fixed-byte discriminator
         0x01 => {
             let discriminator = r.read()?;
@@ -727,6 +796,27 @@ fn decode_2byte(r: &mut ByteReader, op: u8, pfx: &Prefixes, op_size: u8, _rip: u
                 0xF9 => (Rdtscp, 0, vec![]),   // RDTSCP   — TSC + processor ID
                 _    => (Unknown(0x01), 0, vec![]),
             }
+        }
+
+        // ── 0F 38 xx: Three-byte SSSE3 / SSE4.x escape ───────────────────
+        // All instructions in this space have a ModRM byte (no imm).
+        // We consume sub-opcode + ModRM (+ any SIB/displacement) and treat
+        // the entire encoding as a Nop.  When glibc is told we support only
+        // SSE2 (see CPUID), it will not emit these in hot paths; but we still
+        // need to decode them gracefully in case they appear in dead code.
+        0x38 => {
+            let _sub = r.read()?;
+            let _ = decode_modrm_with_mem(r, pfx, 0)?;
+            (Nop, 0, vec![])
+        }
+
+        // ── 0F 3A xx: Three-byte SSE4.x / SSSE3 escape (has imm8) ────────
+        // Every instruction here is ModRM + imm8.
+        0x3A => {
+            let _sub = r.read()?;
+            let _ = decode_modrm_with_mem(r, pfx, 0)?;
+            let _ = r.read()?; // imm8
+            (Nop, 0, vec![])
         }
 
         // ── CMOVcc ────────────────────────────────────────────────────────
@@ -818,6 +908,242 @@ fn decode_2byte(r: &mut ByteReader, op: u8, pfx: &Prefixes, op_size: u8, _rip: u
                    let dst = mem.unwrap_or_else(|| Reg(modrm.rm_ext(pfx.rex_b())));
                    let src = Reg(modrm.reg_ext(pfx.rex_r()));
                    (Cmpxchg, op_size, vec![dst, src]) }
+
+        // ── SSE/MMX 2-byte opcode families ────────────────────────────────
+        //
+        // Nearly every 2-byte opcode in these ranges carries a ModRM byte
+        // (with the few exceptions — 0x77=EMMS, 0xA0/A1/A8/A9 push/pop FS/GS
+        // — being uncommon enough in glibc startup code not to matter).
+        //
+        // Without consuming ModRM, `Unknown` returns a short length and the
+        // next decode starts inside the previous instruction's operands,
+        // silently mis-executing garbage bytes.  These Nop handlers keep the
+        // byte stream aligned so subsequent instructions decode correctly.
+        //
+        // 0F 10: MOVUPS xmm1, xmm2/m128 (no prefix = unaligned load)
+        //        MOVSS/MOVSD/MOVUPD with prefix variants decoded as Nop (not yet needed).
+        0x10 => {
+            let (modrm, mem) = decode_modrm_with_mem(r, pfx, 0)?;
+            if pfx.rep == 0 && !pfx.osz {
+                let src = mem.unwrap_or_else(|| Xmm(modrm.rm_ext(pfx.rex_b())));
+                let dst = Xmm(modrm.reg_ext(pfx.rex_r()));
+                (Movups, 128, vec![dst, src])
+            } else {
+                (Nop, 0, vec![])
+            }
+        }
+        // 0F 11: MOVUPS xmm2/m128, xmm1 (no prefix = unaligned store)
+        0x11 => {
+            let (modrm, mem) = decode_modrm_with_mem(r, pfx, 0)?;
+            if pfx.rep == 0 && !pfx.osz {
+                let dst = mem.unwrap_or_else(|| Xmm(modrm.rm_ext(pfx.rex_b())));
+                let src = Xmm(modrm.reg_ext(pfx.rex_r()));
+                (Movups, 128, vec![dst, src])
+            } else {
+                (Nop, 0, vec![])
+            }
+        }
+        // 0F 12-15: MOVLPS/MOVHLPS/UNPCKLPS/UNPCKHPS — not needed yet.
+        0x12..=0x15 => { let _ = decode_modrm_with_mem(r, pfx, 0)?; (Nop, 0, vec![]) }
+        // 0F 16 (no prefix, mem): MOVHPS XMM,m64 — load 64b into XMM high half, keep low.
+        // 0F 16 (no prefix, reg): MOVLHPS XMM1,XMM2 — XMM1.high = XMM2.low.
+        0x16 => {
+            let (modrm, mem) = decode_modrm_with_mem(r, pfx, 0)?;
+            if pfx.rep == 0 && !pfx.osz {
+                let dst = Xmm(modrm.reg_ext(pfx.rex_r()));
+                let src = mem.unwrap_or_else(|| Xmm(modrm.rm_ext(pfx.rex_b())));
+                (Movhps, 64, vec![dst, src])
+            } else { (Nop, 0, vec![]) }
+        }
+        // 0F 17 (no prefix, mem): MOVHPS m64,XMM — store XMM high 64b to memory.
+        0x17 => {
+            let (modrm, mem) = decode_modrm_with_mem(r, pfx, 0)?;
+            if pfx.rep == 0 && !pfx.osz {
+                if let Some(m) = mem {
+                    let src = Xmm(modrm.reg_ext(pfx.rex_r()));
+                    (Movhps, 64, vec![m, src])
+                } else { (Nop, 0, vec![]) }
+            } else { (Nop, 0, vec![]) }
+        }
+        // 0F 28: MOVAPS xmm1, xmm2/m128 (aligned load, no prefix)
+        0x28 => {
+            let (modrm, mem) = decode_modrm_with_mem(r, pfx, 0)?;
+            if !pfx.osz && pfx.rep == 0 {
+                let src = mem.unwrap_or_else(|| Xmm(modrm.rm_ext(pfx.rex_b())));
+                let dst = Xmm(modrm.reg_ext(pfx.rex_r()));
+                (Movaps, 128, vec![dst, src])
+            } else {
+                (Nop, 0, vec![])
+            }
+        }
+        // 0F 29: MOVAPS xmm2/m128, xmm1 (aligned store, no prefix)
+        0x29 => {
+            let (modrm, mem) = decode_modrm_with_mem(r, pfx, 0)?;
+            if !pfx.osz && pfx.rep == 0 {
+                let dst = mem.unwrap_or_else(|| Xmm(modrm.rm_ext(pfx.rex_b())));
+                let src = Xmm(modrm.reg_ext(pfx.rex_r()));
+                (Movaps, 128, vec![dst, src])
+            } else {
+                (Nop, 0, vec![])
+            }
+        }
+        // 0F 2A-2F: CVTPI2PS, MOVNTPS, CVTTPS2PI, CVTPS2PI, UCOMISS, COMISS
+        0x2A..=0x2F => { let _ = decode_modrm_with_mem(r, pfx, 0)?; (Nop, 0, vec![]) }
+        // 0F 50-56: MOVMSKPS, SQRTPS/SS, RSQRTPS/SS, RCPPS/SS, ANDPS, ANDNPS, ORPS
+        0x50..=0x56 => { let _ = decode_modrm_with_mem(r, pfx, 0)?; (Nop, 0, vec![]) }
+        // 0F 57: XORPS xmm1, xmm2/m128 — bitwise XOR; used by ld-linux for XMM zeroing
+        0x57 => {
+            let (modrm, mem) = decode_modrm_with_mem(r, pfx, 0)?;
+            let src = mem.unwrap_or_else(|| Xmm(modrm.rm_ext(pfx.rex_b())));
+            let dst = Xmm(modrm.reg_ext(pfx.rex_r()));
+            (Pxor, 128, vec![dst, src])
+        }
+        // 0F 58-5F: ADDPS/SS, MULPS/SS, CVTPS2PD, CVTDQ2PS, SUBPS/SS, MINPS/SS, DIVPS/SS, MAXPS/SS
+        0x58..=0x5F => { let _ = decode_modrm_with_mem(r, pfx, 0)?; (Nop, 0, vec![]) }
+        // 0F 60-6F: PUNPCKL*, PACKSSWB, PCMPGT*, PACKUSWB, PUNPCKH*,
+        //           PACKSSDW, PUNPCKLQDQ, PUNPCKHQDQ, MOVD, MOVQ/MOVDQA/MOVDQU
+        0x60 => {
+            let (modrm, mem) = decode_modrm_with_mem(r, pfx, 0)?;
+            if pfx.osz {
+                let src = mem.unwrap_or_else(|| Xmm(modrm.rm_ext(pfx.rex_b())));
+                (Punpcklbw, 128, vec![Xmm(modrm.reg_ext(pfx.rex_r())), src])
+            } else { (Nop, 0, vec![]) }
+        }
+        0x61 => {
+            let (modrm, mem) = decode_modrm_with_mem(r, pfx, 0)?;
+            if pfx.osz {
+                let src = mem.unwrap_or_else(|| Xmm(modrm.rm_ext(pfx.rex_b())));
+                (Punpcklwd, 128, vec![Xmm(modrm.reg_ext(pfx.rex_r())), src])
+            } else { (Nop, 0, vec![]) }
+        }
+        0x62..=0x6D => { let _ = decode_modrm_with_mem(r, pfx, 0)?; (Nop, 0, vec![]) }
+        0x6E => {
+            let (modrm, mem) = decode_modrm_with_mem(r, pfx, 0)?;
+            if pfx.osz {
+                let src = mem.unwrap_or_else(|| Reg(modrm.rm_ext(pfx.rex_b())));
+                if pfx.rex_w() {
+                    // MOVQ xmm, r/m64 (REX.W + 66 prefix)
+                    (Movq, 64, vec![Xmm(modrm.reg_ext(pfx.rex_r())), src])
+                } else {
+                    // MOVD xmm, r/m32
+                    (Movd, 32, vec![Xmm(modrm.reg_ext(pfx.rex_r())), src])
+                }
+            } else { (Nop, 0, vec![]) }
+        }
+        0x6F => {
+            let (modrm, mem) = decode_modrm_with_mem(r, pfx, 0)?;
+            let src = mem.unwrap_or_else(|| Xmm(modrm.rm_ext(pfx.rex_b())));
+            let dst = Xmm(modrm.reg_ext(pfx.rex_r()));
+            if pfx.osz           { (Movdqa, 128, vec![dst, src]) }
+            else if pfx.rep == 0xF3 { (Movdqu, 128, vec![dst, src]) }
+            else { (Nop, 0, vec![]) }
+        }
+        // 0F 70: PSHUFW/PSHUFD/PSHUFHW/PSHUFLW — ModRM + imm8
+        0x70 => {
+            let (modrm, mem) = decode_modrm_with_mem(r, pfx, 0)?;
+            let imm = r.read()? as i64;
+            if pfx.osz {
+                // PSHUFD xmm, xmm/m128, imm8
+                let src = mem.unwrap_or_else(|| Xmm(modrm.rm_ext(pfx.rex_b())));
+                (Pshufd, 128, vec![Xmm(modrm.reg_ext(pfx.rex_r())), src, Imm(imm)])
+            } else { (Nop, 0, vec![]) }
+        }
+        // 0F 71-73: PSRLW/PSRAW/PSLLW/PSRLD/PSRAD/PSLLD/PSRLQ/PSRLDQ/PSLLQ/PSLLDQ
+        //           (group form: ModRM + imm8, no real mem access)
+        0x71..=0x73 => {
+            let _ = decode_modrm_with_mem(r, pfx, 0)?;
+            let _ = r.read()?; // imm8
+            (Nop, 0, vec![])
+        }
+        // 0F 74-76: PCMPEQB/W/D — ModRM only
+        // 0F 77: EMMS — no ModRM; uncommon in glibc SSE2 code, accept the risk
+        // 0F 78-7F: INSERTQ/EXTRQ, HADDPD/HSUBPD, MOVD/MOVQ store forms — ModRM only
+        0x74 => {
+            let (modrm, mem) = decode_modrm_with_mem(r, pfx, 0)?;
+            if pfx.osz {
+                let src = mem.unwrap_or_else(|| Xmm(modrm.rm_ext(pfx.rex_b())));
+                (Pcmpeqb, 128, vec![Xmm(modrm.reg_ext(pfx.rex_r())), src])
+            } else { (Nop, 0, vec![]) }
+        }
+        // F3 0F 7E: MOVQ XMM, XMM/m64 — load 64b into XMM low, zero high 64b.
+        0x7E => {
+            let (modrm, mem) = decode_modrm_with_mem(r, pfx, 0)?;
+            if pfx.rep == 0xF3 {
+                let src = mem.unwrap_or_else(|| Xmm(modrm.rm_ext(pfx.rex_b())));
+                let dst = Xmm(modrm.reg_ext(pfx.rex_r()));
+                (Movq, 64, vec![dst, src])
+            } else { (Nop, 0, vec![]) }
+        }
+        0x75 | 0x76 | 0x78..=0x7D | 0x7F => {
+            let _ = decode_modrm_with_mem(r, pfx, 0)?;
+            (Nop, 0, vec![])
+        }
+        // 0F C2: CMPPS/CMPSS/CMPPD/CMPSD — ModRM + imm8
+        0xC2 => {
+            let _ = decode_modrm_with_mem(r, pfx, 0)?;
+            let _ = r.read()?; // imm8 predicate
+            (Nop, 0, vec![])
+        }
+        // 0F C3: MOVNTI r/m, r — ModRM (store to memory, no imm)
+        0xC3 => { let _ = decode_modrm_with_mem(r, pfx, 0)?; (Nop, 0, vec![]) }
+        // 0F C4: PINSRW reg, r/m, imm8 — ModRM + imm8
+        // 0F C5: PEXTRW reg, mm/xmm, imm8 — ModRM + imm8
+        // 0F C6: SHUFPS/SHUFPD — ModRM + imm8
+        0xC4..=0xC6 => {
+            let _ = decode_modrm_with_mem(r, pfx, 0)?;
+            let _ = r.read()?; // imm8
+            (Nop, 0, vec![])
+        }
+        // 0F C7: CMPXCHG8B(/1), VMPTRLD/VMCLEAR/VMXON(/6), RDRAND(/6), RDSEED(/7)
+        0xC7 => { let _ = decode_modrm_with_mem(r, pfx, 0)?; (Nop, 0, vec![]) }
+        // 0F D0-DF: ADDSUBPD/PS, PSRL*, PADDQ, PMULLW, MOVQ store, PMOVMSKB,
+        //           PSUBUS*, PMINUB, PAND, PADDUS*, PMAXUB, PANDN
+        0xD7 => {
+            let (modrm, _) = decode_modrm_with_mem(r, pfx, 0)?;
+            if pfx.osz {
+                // PMOVMSKB r32, xmm — register-to-register only
+                (Pmovmskb, 32, vec![Reg(modrm.reg_ext(pfx.rex_r())), Xmm(modrm.rm_ext(pfx.rex_b()))])
+            } else { (Nop, 0, vec![]) }
+        }
+        0xDB => {
+            let (modrm, mem) = decode_modrm_with_mem(r, pfx, 0)?;
+            if pfx.osz {
+                let src = mem.unwrap_or_else(|| Xmm(modrm.rm_ext(pfx.rex_b())));
+                (Pand, 128, vec![Xmm(modrm.reg_ext(pfx.rex_r())), src])
+            } else { (Nop, 0, vec![]) }
+        }
+        0xDF => {
+            let (modrm, mem) = decode_modrm_with_mem(r, pfx, 0)?;
+            if pfx.osz {
+                let src = mem.unwrap_or_else(|| Xmm(modrm.rm_ext(pfx.rex_b())));
+                (Pandn, 128, vec![Xmm(modrm.reg_ext(pfx.rex_r())), src])
+            } else { (Nop, 0, vec![]) }
+        }
+        0xD0..=0xD6 | 0xD8..=0xDA | 0xDC..=0xDE => {
+            let _ = decode_modrm_with_mem(r, pfx, 0)?; (Nop, 0, vec![])
+        }
+        // 0F E0-EF: PAVGB, PSRA*, PAVGW, PMULHUW, PMULHW, CVTTPD2DQ/CVTPD2DQ/CVTDQ2PD,
+        //           MOVNTDQ, PSUBSB/SW, PMINSW, POR, PADDSB/SW, PMAXSW, PXOR
+        0xEB => {
+            let (modrm, mem) = decode_modrm_with_mem(r, pfx, 0)?;
+            if pfx.osz {
+                let src = mem.unwrap_or_else(|| Xmm(modrm.rm_ext(pfx.rex_b())));
+                (Por, 128, vec![Xmm(modrm.reg_ext(pfx.rex_r())), src])
+            } else { (Nop, 0, vec![]) }
+        }
+        0xEF => {
+            let (modrm, mem) = decode_modrm_with_mem(r, pfx, 0)?;
+            if pfx.osz {
+                let src = mem.unwrap_or_else(|| Xmm(modrm.rm_ext(pfx.rex_b())));
+                (Pxor, 128, vec![Xmm(modrm.reg_ext(pfx.rex_r())), src])
+            } else { (Nop, 0, vec![]) }
+        }
+        0xE0..=0xEA | 0xEC..=0xEE => {
+            let _ = decode_modrm_with_mem(r, pfx, 0)?; (Nop, 0, vec![])
+        }
+        // 0F F0-FE: LDDQU, PSLL*, PMULUDQ, PMADDWD, PSADBW, MASKMOVQ/DQU,
+        //           PSUB*, PADD*
+        0xF0..=0xFE => { let _ = decode_modrm_with_mem(r, pfx, 0)?; (Nop, 0, vec![]) }
 
         _ => (Unknown(op), 0, vec![]),
     })

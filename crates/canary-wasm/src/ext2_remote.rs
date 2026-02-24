@@ -473,10 +473,19 @@ impl RemoteExt2 {
     }
 
     /// Fetch multiple blocks concurrently via parallel HTTP Range requests.
-    /// Blocks already in `block_cache` are skipped.  All successfully fetched
-    /// blocks are inserted into `block_cache` before returning.
+    ///
+    /// Consecutive block numbers are coalesced into a single Range request to
+    /// reduce round-trips and maximise throughput.  Each coalesced run is
+    /// capped at `MAX_COALESCE_BLOCKS` blocks (≤ 1 MiB for 4 KiB blocks) to
+    /// bound individual response size.  All runs are issued in parallel via
+    /// `futures::future::join_all`; with HTTP/2 the server can serve dozens of
+    /// streams concurrently over one connection.
+    ///
+    /// Blocks already present in `block_cache` are skipped.  Successfully
+    /// fetched blocks are inserted into `block_cache` before returning.
     async fn prefetch_blocks(&mut self, block_nos: &[u32]) {
         let block_size = match self.sb.as_ref() { Some(s) => s.block_size, None => return };
+
         let mut needed: Vec<u32> = block_nos.iter()
             .filter(|&&b| b != 0 && !self.block_cache.contains_key(&b))
             .copied()
@@ -485,20 +494,45 @@ impl RemoteExt2 {
         needed.dedup();
         if needed.is_empty() { return; }
 
+        // Merge consecutive block numbers into runs; cap each run to 256 blocks.
+        const MAX_COALESCE: u32 = 256;
+        let mut runs: Vec<(u32, u32)> = Vec::new(); // (first_block, count)
+        let mut run_start = needed[0];
+        let mut run_len   = 1u32;
+        for &b in &needed[1..] {
+            if b == run_start + run_len && run_len < MAX_COALESCE {
+                run_len += 1;
+            } else {
+                runs.push((run_start, run_len));
+                run_start = b;
+                run_len   = 1;
+            }
+        }
+        runs.push((run_start, run_len));
+
         let url = self.url.clone();
-        // Futures only capture `url` (cloned) — no reference to `self` —
-        // so they can all be in-flight simultaneously even in single-threaded WASM.
-        let fetches: Vec<_> = needed.iter().map(|&block| {
-            let url = url.clone();
-            let start = block as u64 * block_size as u64;
-            let end   = start + block_size as u64 - 1;
-            async move { (block, fetch_range(&url, start, end).await) }
+        let bs  = block_size as u64;
+
+        // Fire all run-fetches in parallel (no reference to `self` in closures).
+        let fetches: Vec<_> = runs.iter().map(|&(first, count)| {
+            let url   = url.clone();
+            let start = first as u64 * bs;
+            let end   = start + count as u64 * bs - 1;
+            async move { (first, count, fetch_range(&url, start, end).await) }
         }).collect();
 
         let results = futures::future::join_all(fetches).await;
-        for (block, result) in results {
+        for (first, count, result) in results {
             if let Ok(data) = result {
-                self.block_cache.insert(block, data);
+                // Slice the coalesced response back into individual cached blocks.
+                let bs = block_size as usize;
+                for i in 0..count as usize {
+                    let s = i * bs;
+                    let e = (s + bs).min(data.len());
+                    if s < data.len() {
+                        self.block_cache.insert(first + i as u32, data[s..e].to_vec());
+                    }
+                }
             }
         }
     }

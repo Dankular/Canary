@@ -40,7 +40,15 @@ pub fn compute_addr(cpu: &CpuState, ma: &MemAddr, next_rip: u64) -> u64 {
         ma.base.map(|r| cpu.gpr[r]).unwrap_or(0)
     };
     let index = ma.index.map(|r| cpu.gpr[r].wrapping_mul(ma.scale as u64)).unwrap_or(0);
-    base.wrapping_add(index).wrapping_add(ma.disp as u64)
+    let linear = base.wrapping_add(index).wrapping_add(ma.disp as u64);
+    // Apply FS/GS segment base for TLS-relative accesses (x86-64 ABI).
+    // Decoder stores: FS=4 (prefix 0x64), GS=5 (prefix 0x65).
+    // CS/DS/ES/SS have base 0 in 64-bit mode and are left as-is.
+    match ma.seg {
+        Some(4) => linear.wrapping_add(cpu.fs_base), // FS override
+        Some(5) => linear.wrapping_add(cpu.gs_base), // GS override
+        _       => linear,
+    }
 }
 
 // ── Operand read ──────────────────────────────────────────────────────────────
@@ -97,6 +105,45 @@ pub fn write_op(cpu: &mut CpuState, mem: &mut GuestMemory, op: &Operand, sz: u8,
         _ => {}
     }
     Ok(())
+}
+
+// ── XMM 128-bit helpers ───────────────────────────────────────────────────────
+
+/// Read 128 bits from an XMM register or memory operand into a byte array.
+fn read_xmm128(cpu: &CpuState, mem: &GuestMemory, op: &Operand, next_rip: u64)
+    -> ExecResult<[u8; 16]>
+{
+    match op {
+        Operand::Xmm(r) => Ok(cpu.xmm[*r].0),
+        Operand::Mem(ma) => {
+            let addr = compute_addr(cpu, ma, next_rip);
+            let lo = mem.read_u64(addr)?;
+            let hi = mem.read_u64(addr.wrapping_add(8))?;
+            let mut b = [0u8; 16];
+            b[0..8].copy_from_slice(&lo.to_le_bytes());
+            b[8..16].copy_from_slice(&hi.to_le_bytes());
+            Ok(b)
+        }
+        _ => Ok([0u8; 16]),
+    }
+}
+
+/// Write 128 bits to an XMM register or memory operand.
+fn write_xmm128(cpu: &mut CpuState, mem: &mut GuestMemory, op: &Operand,
+                val: [u8; 16], next_rip: u64) -> ExecResult<()>
+{
+    match op {
+        Operand::Xmm(r) => { cpu.xmm[*r].0 = val; Ok(()) }
+        Operand::Mem(ma) => {
+            let addr = compute_addr(cpu, ma, next_rip);
+            let lo = u64::from_le_bytes(val[0..8].try_into().unwrap());
+            let hi = u64::from_le_bytes(val[8..16].try_into().unwrap());
+            mem.write_u64(addr, lo)?;
+            mem.write_u64(addr.wrapping_add(8), hi)?;
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 // ── Condition code evaluation ─────────────────────────────────────────────────
@@ -186,6 +233,18 @@ pub fn execute(
             write!(&ops[0], extended);
         }
 
+        // MOVSXD r64/r32, r/m32 (opcode 0x63 in 64-bit mode):
+        // Always reads 32-bit source; sign-extends to 64 when sz==64, else 32-bit (zero-extends).
+        Movsxd => {
+            let val = read_op(cpu, mem, &ops[1], 32, next_rip)?;
+            let extended = if sz == 64 {
+                (val as u32) as i32 as i64 as u64  // sign-extend 32→64
+            } else {
+                val & 0xFFFF_FFFF                  // zero-extend 32→32 (r32 write)
+            };
+            write!(&ops[0], extended);
+        }
+
         // ── LEA ──────────────────────────────────────────────────────────
         Lea => {
             let Operand::Mem(ref ma) = ops[1] else { cpu.rip = next_rip; return Ok(()); };
@@ -205,6 +264,24 @@ pub fn execute(
             let rsp = cpu.pop_rsp();
             let val = mem.read_u64(rsp)?;
             write!(&ops[0], val);
+        }
+
+        // ── ENTER / LEAVE ─────────────────────────────────────────────────
+        Enter => {
+            // ENTER alloc_size, level — for level=0 (common case):
+            //   push RBP; RBP = RSP; RSP -= alloc_size
+            let alloc_size = if let Operand::Imm(n) = ops[0] { n as u64 } else { 0 };
+            let rbp = cpu.gpr[reg::RBP];
+            let rsp = cpu.push_rsp();
+            mem.write_u64(rsp, rbp)?;
+            cpu.gpr[reg::RBP] = cpu.gpr[reg::RSP];
+            cpu.gpr[reg::RSP] = cpu.gpr[reg::RSP].wrapping_sub(alloc_size);
+        }
+        Leave => {
+            // RSP = RBP; pop RBP
+            cpu.gpr[reg::RSP] = cpu.gpr[reg::RBP];
+            let rsp = cpu.pop_rsp();
+            cpu.gpr[reg::RBP] = mem.read_u64(rsp)?;
         }
 
         // ── XCHG ─────────────────────────────────────────────────────────
@@ -531,7 +608,12 @@ pub fn execute(
         Hlt => { cpu.rip = next_rip; return Err(ExecError::Halt); }
 
         // ── Ud2 ──────────────────────────────────────────────────────────
-        Ud2 | Unknown(_) => { cpu.rip = next_rip; return Err(ExecError::IllegalInstruction); }
+        Ud2 => { cpu.rip = next_rip; return Err(ExecError::IllegalInstruction); }
+        Unknown(op) => {
+            log::error!("canary: unknown opcode byte {:#04x} @ rip={:#x}", op, cpu.rip);
+            cpu.rip = next_rip;
+            return Err(ExecError::IllegalInstruction);
+        }
 
         // ── CMOVcc ───────────────────────────────────────────────────────
         Cmovcc(cc) => {
@@ -570,20 +652,27 @@ pub fn execute(
             write!(&ops[0], res);
         }
 
-        // ── CWD / CDQ / CQO ──────────────────────────────────────────────
-        Cwde | Cdq | Cqo | Cwd | Cbw | Cdqe => {
+        // ── CBW / CWDE / CDQE (opcode 0x98): sign-extend into RAX only ──
+        // Does NOT touch RDX — that is for CDQ/CQO (opcode 0x99).
+        Cwde | Cbw | Cdqe => {
+            let rax = cpu.read64(reg::RAX);
+            let extended = match sz {
+                16 => (rax & 0xff) as i8 as i64 as u64,    // CBW:  AL  → AX
+                64 => (rax as u32) as i32 as i64 as u64,   // CDQE: EAX → RAX
+                _  => (rax as u16) as i16 as i64 as u64,   // CWDE: AX  → EAX
+            };
+            cpu.write64(reg::RAX, extended);
+        }
+
+        // ── CWD / CDQ / CQO (opcode 0x99): sign-extend RAX into RDX ─────
+        Cdq | Cqo | Cwd => {
             let rax = cpu.read64(reg::RAX);
             let sign = match sz {
-                16 => (rax & 0xff) as i8 as i64 as u64,
-                32 => (rax as u16) as i16 as i64 as u64,
-                64 => (rax as u32) as i32 as i64 as u64,
-                _  => (rax as i64 >> 63) as u64,
+                16 => if rax & 0x8000 != 0 { u64::from(u16::MAX) } else { 0 }, // CWD: AX→DX
+                64 => (rax as i64 >> 63) as u64,                                // CQO: RAX→RDX
+                _  => if rax & 0x8000_0000 != 0 { u64::from(u32::MAX) } else { 0 }, // CDQ: EAX→EDX
             };
-            cpu.write64(reg::RDX, if (sign as i64) < 0 { u64::MAX } else { 0 });
-            // Also sign-extend RAX for CWDE/CDQE
-            if matches!(instr.mnemonic, Cwde | Cdqe | Cbw) {
-                cpu.write64(reg::RAX, sign);
-            }
+            cpu.write64(reg::RDX, sign);
         }
 
         // ── Flags ────────────────────────────────────────────────────────
@@ -741,6 +830,131 @@ pub fn execute(
             return Err(ExecError::IoPort { dir: 0, port, size: instr.op_size, val: 0 });
         }
 
+        // ── SSE2 packed-integer XMM operations ───────────────────────────
+
+        Pxor => {
+            let src = read_xmm128(cpu, mem, &ops[1], next_rip)?;
+            let n = match &ops[0] { Operand::Xmm(n) => *n, _ => 0 };
+            for i in 0..16 { cpu.xmm[n].0[i] ^= src[i]; }
+        }
+        Por => {
+            let src = read_xmm128(cpu, mem, &ops[1], next_rip)?;
+            let n = match &ops[0] { Operand::Xmm(n) => *n, _ => 0 };
+            for i in 0..16 { cpu.xmm[n].0[i] |= src[i]; }
+        }
+        Pand => {
+            let src = read_xmm128(cpu, mem, &ops[1], next_rip)?;
+            let n = match &ops[0] { Operand::Xmm(n) => *n, _ => 0 };
+            for i in 0..16 { cpu.xmm[n].0[i] &= src[i]; }
+        }
+        Pandn => {
+            let src = read_xmm128(cpu, mem, &ops[1], next_rip)?;
+            let n = match &ops[0] { Operand::Xmm(n) => *n, _ => 0 };
+            for i in 0..16 { cpu.xmm[n].0[i] = !cpu.xmm[n].0[i] & src[i]; }
+        }
+        Pcmpeqb => {
+            // Each byte: 0xFF if equal, 0x00 if not.
+            let src = read_xmm128(cpu, mem, &ops[1], next_rip)?;
+            let n = match &ops[0] { Operand::Xmm(n) => *n, _ => 0 };
+            let dst = cpu.xmm[n].0;
+            for i in 0..16 { cpu.xmm[n].0[i] = if dst[i] == src[i] { 0xFF } else { 0x00 }; }
+        }
+        Movdqa | Movdqu | Movaps | Movups => {
+            let src = read_xmm128(cpu, mem, &ops[1], next_rip)?;
+            write_xmm128(cpu, mem, &ops[0], src, next_rip)?;
+        }
+        Movd => {
+            // MOVD xmm, r/m32: zero-extend 32-bit value into XMM, upper 96 bits = 0.
+            let val = read_op(cpu, mem, &ops[1], 32, next_rip)?;
+            let n = match &ops[0] { Operand::Xmm(n) => *n, _ => 0 };
+            cpu.xmm[n].0 = [0u8; 16];
+            cpu.xmm[n].0[0..4].copy_from_slice(&(val as u32).to_le_bytes());
+        }
+        Movq => {
+            // MOVQ XMM←XMM/m64/r64: load 64b into XMM low, zero high 64b.
+            // MOVQ m64/r64←XMM: store XMM low 64b.
+            match (&ops[0], &ops[1]) {
+                (Operand::Xmm(d), Operand::Xmm(s)) => {
+                    let low: [u8; 8] = cpu.xmm[*s].0[0..8].try_into().unwrap();
+                    cpu.xmm[*d].0 = [0u8; 16];
+                    cpu.xmm[*d].0[0..8].copy_from_slice(&low);
+                }
+                (Operand::Xmm(d), _) => {
+                    let val = read_op(cpu, mem, &ops[1], 64, next_rip)?;
+                    cpu.xmm[*d].0 = [0u8; 16];
+                    cpu.xmm[*d].0[0..8].copy_from_slice(&val.to_le_bytes());
+                }
+                (_, Operand::Xmm(s)) => {
+                    let val = u64::from_le_bytes(cpu.xmm[*s].0[0..8].try_into().unwrap());
+                    write_op(cpu, mem, &ops[0], 64, val, next_rip)?;
+                }
+                _ => {}
+            }
+        }
+        Movhps => {
+            // MOVHPS XMM,m64: load m64 into XMM high 64b, keep low unchanged.
+            // MOVHPS m64,XMM: store XMM high 64b to memory.
+            // MOVLHPS XMM1,XMM2 (reg-reg): XMM1.high = XMM2.low.
+            match (&ops[0], &ops[1]) {
+                (Operand::Xmm(d), Operand::Xmm(s)) => {
+                    // MOVLHPS: dst.high = src.low
+                    let low: [u8; 8] = cpu.xmm[*s].0[0..8].try_into().unwrap();
+                    cpu.xmm[*d].0[8..16].copy_from_slice(&low);
+                }
+                (Operand::Xmm(d), _) => {
+                    // MOVHPS load: XMM.high = m64, keep XMM.low
+                    let val = read_op(cpu, mem, &ops[1], 64, next_rip)?;
+                    cpu.xmm[*d].0[8..16].copy_from_slice(&val.to_le_bytes());
+                }
+                (_, Operand::Xmm(s)) => {
+                    // MOVHPS store: m64 = XMM.high
+                    let val = u64::from_le_bytes(cpu.xmm[*s].0[8..16].try_into().unwrap());
+                    write_op(cpu, mem, &ops[0], 64, val, next_rip)?;
+                }
+                _ => {}
+            }
+        }
+        Pmovmskb => {
+            // Extract the MSB of each of the 16 bytes in XMM into a 16-bit mask in r32.
+            let n = match &ops[1] { Operand::Xmm(n) => *n, _ => 0 };
+            let mut mask = 0u32;
+            for i in 0..16 { if cpu.xmm[n].0[i] & 0x80 != 0 { mask |= 1 << i; } }
+            write_op(cpu, mem, &ops[0], 32, mask as u64, next_rip)?;
+        }
+        Punpcklbw => {
+            // Interleave low 8 bytes of dst and src: [d0,s0,d1,s1,...,d7,s7]
+            let src = read_xmm128(cpu, mem, &ops[1], next_rip)?;
+            let n = match &ops[0] { Operand::Xmm(n) => *n, _ => 0 };
+            let dst = cpu.xmm[n].0;
+            let mut result = [0u8; 16];
+            for i in 0..8 { result[i*2] = dst[i]; result[i*2+1] = src[i]; }
+            cpu.xmm[n].0 = result;
+        }
+        Punpcklwd => {
+            // Interleave low 4 words of dst and src: [d0,s0,d1,s1,d2,s2,d3,s3] (words)
+            let src = read_xmm128(cpu, mem, &ops[1], next_rip)?;
+            let n = match &ops[0] { Operand::Xmm(n) => *n, _ => 0 };
+            let dst = cpu.xmm[n].0;
+            let mut result = [0u8; 16];
+            for i in 0..4 {
+                result[i*4]   = dst[i*2];   result[i*4+1] = dst[i*2+1];
+                result[i*4+2] = src[i*2];   result[i*4+3] = src[i*2+1];
+            }
+            cpu.xmm[n].0 = result;
+        }
+        Pshufd => {
+            // Shuffle 4 dwords within XMM using imm8: bits[2k+1:2k] = source index for dst dword k.
+            let src = read_xmm128(cpu, mem, &ops[1], next_rip)?;
+            let imm = match &ops[2] { Operand::Imm(v) => *v as u8, _ => 0 };
+            let n = match &ops[0] { Operand::Xmm(n) => *n, _ => 0 };
+            let mut result = [0u8; 16];
+            for i in 0..4usize {
+                let sel = ((imm >> (i * 2)) & 3) as usize;
+                result[i*4..i*4+4].copy_from_slice(&src[sel*4..sel*4+4]);
+            }
+            cpu.xmm[n].0 = result;
+        }
+
         // ── Unimplemented — continue for now ─────────────────────────────
         _ => {
             // Log and skip rather than crashing for unimplemented insns.
@@ -761,25 +975,32 @@ fn emulate_cpuid(leaf: u32) -> (u32, u32, u32, u32) {
             (7, 0x756e6547, 0x6c65746e, 0x49656e69)
         }
         1 => {
-            // Family 6, Model 15 (Core 2 Duo); ECX: SSE3/SSSE3/SSE4.1/SSE4.2/POPCNT
-            let ecx: u32 = (1 << 0)  // SSE3
-                         | (1 << 9)  // SSSE3
-                         | (1 << 19) // SSE4.1
-                         | (1 << 20) // SSE4.2
-                         | (1 << 23) // POPCNT
-                         ;
+            // Family 6, Model 15.  Deliberately omit SSE2 (and higher) so
+            // that ld-linux uses its scalar RELA relocation loop.  The SSE2
+            // vectorised loop uses MOVDQA/PADDQ/MOVQ-xmm which we stub as
+            // Nop; leaving SSE2 advertised causes relocations to be silently
+            // skipped, producing null-pointer crashes when ld-linux calls
+            // through unpatched GOT entries.  Scalar relocation uses only
+            // standard 64-bit instructions and works correctly.
+            // MMX/FXSR/SSE are also cleared: glibc ifunc resolvers for those
+            // paths can emit 0F-prefixed instructions we haven't implemented.
+            let ecx: u32 = 0; // No SSE3, SSSE3, SSE4.x, POPCNT, AVX, OSXSAVE
             let edx: u32 = (1 << 0)  // FPU
                          | (1 << 4)  // TSC
                          | (1 << 6)  // PAE
                          | (1 << 8)  // CX8
                          | (1 << 15) // CMOV
                          | (1 << 19) // CLFSH
-                         | (1 << 23) // MMX
-                         | (1 << 24) // FXSR
-                         | (1 << 25) // SSE
-                         | (1 << 26) // SSE2
+                         // SSE, SSE2, MMX, FXSR intentionally NOT set —
+                         // forces scalar code paths in ld-linux and glibc.
                          ;
-            (0x0006_0F0F, 0x0100_0800, ecx, edx)
+            // EAX = Family 6, Model 15 (Core 2 era), Stepping 0.
+            // Stepping bits 3:0 MUST be 0: ld-linux stores EAX&0xf into a
+            // stack slot that it later uses as a string pointer, and the
+            // null-check (TEST R14,R14; JZ) only skips the dereference when
+            // the value is zero.  Stepping 0xF (15) caused "address 0xf not
+            // mapped" at RIP=0x10006daa inside _dl_important_hwcaps.
+            (0x0006_0F00, 0x0100_0800, ecx, edx)
         }
         7 => {
             // Extended features; FSGSBASE in EBX bit 0
