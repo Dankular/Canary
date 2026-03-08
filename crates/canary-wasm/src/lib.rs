@@ -1514,32 +1514,99 @@ fn decode_x86_load(bytes: &[u8]) -> Option<(usize, Option<usize>)> {
 
     if !two_byte {
         match opcode {
-            // MOV r, [mem] -- reg gets loaded value, zero it
+            // ── MOV ──────────────────────────────────────────────────────────
+            // MOV r, [mem]
             0x8A | 0x8B => decode_modrm(pos, true),
-            // MOV [mem], r -- memory is target, no reg to zero
+            // MOV [mem], r
             0x88 | 0x89 => decode_modrm(pos, false).map(|(p, _)| (p, None)),
-            // Group 1: ADD/OR/ADC/SBB/AND/SUB/XOR/CMP  rm, imm
+            // MOV r/m, imm8
+            0xC6 => decode_modrm(pos, false).map(|(p, _)| (p + 1, None)),
+            // MOV r/m, imm16/32
+            0xC7 => decode_modrm(pos, false).map(|(p, _)| (p + if opsz_16 { 2 } else { 4 }, None)),
+
+            // ── Arithmetic/logic r/m ← imm (Group 1) ────────────────────────
             0x80 | 0x82 => decode_modrm(pos, false).map(|(p, _)| (p + 1, None)),
             0x83         => decode_modrm(pos, false).map(|(p, _)| (p + 1, None)),
             0x81         => decode_modrm(pos, false).map(|(p, _)| (p + if opsz_16 { 2 } else { 4 }, None)),
-            // CMP/TEST rm, r
-            0x38|0x39|0x3A|0x3B|0x84|0x85 => decode_modrm(pos, false).map(|(p,_)| (p, None)),
-            // Arithmetic reg, [mem]: ADD OR ADC SBB AND SUB XOR
+
+            // ── Arithmetic/logic r/m ← r  (mem is destination, no dest reg) ─
+            0x00|0x01|0x08|0x09|0x10|0x11|0x18|0x19|
+            0x20|0x21|0x28|0x29|0x30|0x31|
+            0x38|0x39|0x3A|0x3B|0x84|0x85
+                => decode_modrm(pos, false).map(|(p, _)| (p, None)),
+
+            // ── Arithmetic/logic reg ← [mem] ─────────────────────────────────
             0x02|0x03|0x0A|0x0B|0x12|0x13|0x1A|0x1B|
-            0x22|0x23|0x2A|0x2B|0x32|0x33 => decode_modrm(pos, true),
-            // XCHG, LEA
-            0x86|0x87 => decode_modrm(pos, false).map(|(p,_)| (p, None)),
-            0x8D      => decode_modrm(pos, true),
+            0x22|0x23|0x2A|0x2B|0x32|0x33
+                => decode_modrm(pos, true),
+
+            // ── XCHG r/m, r ──────────────────────────────────────────────────
+            0x86|0x87 => decode_modrm(pos, false).map(|(p, _)| (p, None)),
+
+            // ── LEA reg, [mem] ────────────────────────────────────────────────
+            0x8D => decode_modrm(pos, true),
+
+            // ── Shift/rotate r/m by imm8 (Group 2) ───────────────────────────
+            0xC0 | 0xC1 => decode_modrm(pos, false).map(|(p, _)| (p + 1, None)),
+            // Shift/rotate r/m by 1 or CL
+            0xD0|0xD1|0xD2|0xD3 => decode_modrm(pos, false).map(|(p, _)| (p, None)),
+
+            // ── IMUL reg, r/m, imm ───────────────────────────────────────────
+            0x69 => decode_modrm(pos, true).map(|(p, d)| (p + if opsz_16 { 2 } else { 4 }, d)),
+            0x6B => decode_modrm(pos, true).map(|(p, d)| (p + 1, d)),
+
+            // ── Group 3: TEST/NOT/NEG/MUL/IMUL/DIV/IDIV ──────────────────────
+            // 0xF6 = byte operand: reg 0|1 = TEST r/m8, imm8
+            0xF6 => {
+                if pos >= bytes.len() { return None; }
+                let modrm_reg = (bytes[pos] >> 3) & 7;
+                let imm = if modrm_reg <= 1 { 1usize } else { 0 };
+                decode_modrm(pos, false).map(|(p, _)| (p + imm, None))
+            }
+            // 0xF7 = word/dword/qword: reg 0|1 = TEST r/m, imm16/32
+            0xF7 => {
+                if pos >= bytes.len() { return None; }
+                let modrm_reg = (bytes[pos] >> 3) & 7;
+                let imm = if modrm_reg <= 1 { if opsz_16 { 2usize } else { 4 } } else { 0 };
+                decode_modrm(pos, false).map(|(p, _)| (p + imm, None))
+            }
+
+            // ── Group 4/5: INC/DEC/CALL/JMP/PUSH r/m ────────────────────────
+            // For our purposes (null-deref recovery), just skip over the ModRM;
+            // these typically don't have a GPR destination for a loaded value.
+            0xFE | 0xFF => decode_modrm(pos, false).map(|(p, _)| (p, None)),
+
             _ => None,
         }
     } else {
         match opcode2 {
-            // MOVZX / MOVSX
+            // ── MOVZX / MOVSX ─────────────────────────────────────────────────
             0xB6|0xB7|0xBE|0xBF => decode_modrm(pos, true),
-            // CMOV
+
+            // ── CMOVcc ───────────────────────────────────────────────────────
             0x40..=0x4F => decode_modrm(pos, true),
-            // BSF / BSR
+
+            // ── BSF / BSR ────────────────────────────────────────────────────
             0xBC|0xBD => decode_modrm(pos, true),
+
+            // ── IMUL reg, r/m ─────────────────────────────────────────────────
+            0xAF => decode_modrm(pos, true),
+
+            // ── Bit tests: BT/BTS/BTR/BTC r/m, r ────────────────────────────
+            0xA3|0xAB|0xB3|0xBB => decode_modrm(pos, false).map(|(p, _)| (p, None)),
+
+            // ── Group 8: BT/BTS/BTR/BTC r/m, imm8 ───────────────────────────
+            0xBA => decode_modrm(pos, false).map(|(p, _)| (p + 1, None)),
+
+            // ── SETcc r/m8 ────────────────────────────────────────────────────
+            0x90..=0x9F => decode_modrm(pos, false).map(|(p, _)| (p, None)),
+
+            // ── XADD r/m, r ──────────────────────────────────────────────────
+            0xC0|0xC1 => decode_modrm(pos, false).map(|(p, _)| (p, None)),
+
+            // ── SSE scalar/packed moves (XMM only — no GPR zeroing needed) ───
+            0x10..=0x17|0x28..=0x2F => decode_modrm(pos, false).map(|(p, _)| (p, None)),
+
             _ => None,
         }
     }
