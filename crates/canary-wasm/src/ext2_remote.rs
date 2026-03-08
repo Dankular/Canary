@@ -83,6 +83,8 @@ pub struct RemoteExt2 {
     sb:          Option<Sb>,
     bgdt:        Vec<u8>,          // raw block-group descriptor table
     block_cache: HashMap<u32, Vec<u8>>,
+    /// Cache of absolute path → inode number for directory entries already resolved.
+    dir_cache:   HashMap<String, u32>,
 }
 
 impl RemoteExt2 {
@@ -92,6 +94,7 @@ impl RemoteExt2 {
             sb:          None,
             bgdt:        Vec::new(),
             block_cache: HashMap::new(),
+            dir_cache:   HashMap::new(),
         }
     }
 
@@ -649,14 +652,30 @@ impl RemoteExt2 {
             .collect();
 
         if components.is_empty() {
-            // Caller asked for root — return root inode.
             return Some(cur_ino);
         }
 
-        for (i, component) in components.iter().enumerate() {
+        // Fast-path: check if any prefix of path is already in dir_cache.
+        // Walk backwards from the longest prefix to find the deepest cached point.
+        let mut start_idx = 0;
+        for end in (1..=components.len()).rev() {
+            let prefix = "/".to_string() + &components[..end].join("/");
+            if let Some(&ino) = self.dir_cache.get(&prefix) {
+                cur_ino = ino;
+                start_idx = end;
+                break;
+            }
+        }
+
+        for (i, component) in components[start_idx..].iter().enumerate() {
+            let abs_i = start_idx + i;
             let inode_data = self.get_inode(cur_ino).await?;
             let dir_data   = self.read_inode_data(&inode_data).await;
             let entries    = Self::parse_dir_data(&dir_data);
+
+            // Cache inode of current directory for future lookups.
+            let cur_path = "/".to_string() + &components[..abs_i].join("/");
+            self.dir_cache.insert(cur_path, cur_ino);
 
             // Find this component in the directory.
             let found = entries.into_iter().find(|(name, _, _)| name == component);
