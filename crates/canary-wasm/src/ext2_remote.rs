@@ -695,18 +695,36 @@ impl RemoteExt2 {
                 let link_inode = self.get_inode(child_ino).await?;
                 let target_bytes = self.read_inode_data(&link_inode).await;
                 let target = String::from_utf8_lossy(&target_bytes).into_owned();
-                // Only handle absolute symlinks for now; relative ones are rare in /usr paths.
-                if target.starts_with('/') {
-                    // Recurse into the resolved absolute target + remaining components.
-                    let remaining = components[i+1..].join("/");
-                    let resolved = if remaining.is_empty() {
-                        target
+                // Resolve absolute or relative symlink.
+                let resolved_target = if target.starts_with('/') {
+                    target
+                } else {
+                    // Relative symlink: resolve against the parent directory.
+                    // e.g. /bin → usr/bin  means the symlink is at / pointing to usr/bin.
+                    let parent = if abs_i == 0 {
+                        "/".to_string()
                     } else {
-                        format!("{target}/{remaining}")
+                        "/".to_string() + &components[..abs_i].join("/")
                     };
-                    return Box::pin(self.lookup_path(&resolved)).await;
-                }
-                return None;
+                    let combined = format!("{}/{}", parent, target);
+                    // Normalise: remove . and collapse ..
+                    let mut parts: Vec<&str> = Vec::new();
+                    for seg in combined.split('/') {
+                        match seg {
+                            "" | "." => {}
+                            ".." => { parts.pop(); }
+                            s => parts.push(s),
+                        }
+                    }
+                    "/".to_string() + &parts.join("/")
+                };
+                let remaining = components[abs_i+1..].join("/");
+                let resolved = if remaining.is_empty() {
+                    resolved_target
+                } else {
+                    format!("{resolved_target}/{remaining}")
+                };
+                return Box::pin(self.lookup_path(&resolved)).await;
             } else {
                 return None;
             }
