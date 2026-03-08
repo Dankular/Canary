@@ -310,7 +310,7 @@ pub fn handle_syscall(
                     let fd = ctx.fds.alloc(ino, flags);
                     fd as i64
                 }
-                Err(_) => { ctx.vfs_misses.push(abs.clone()); -ENOENT }
+                Err(_) => { log::warn!("[VFS miss] {}", abs); ctx.vfs_misses.push(abs.clone()); -ENOENT }
             }
         }
 
@@ -347,7 +347,7 @@ pub fn handle_syscall(
                     let fd = ctx.fds.alloc(ino, flags);
                     fd as i64
                 }
-                Err(_) => { ctx.vfs_misses.push(abs.clone()); -ENOENT }
+                Err(_) => { log::warn!("[VFS miss] {}", abs); ctx.vfs_misses.push(abs.clone()); -ENOENT }
             }
         }
 
@@ -384,7 +384,7 @@ pub fn handle_syscall(
                     write_stat(mem, a1, ctx.vfs.mem.node(ino).stat.clone())?;
                     0
                 }
-                Err(_) => { ctx.vfs_misses.push(abs.clone()); -ENOENT }
+                Err(_) => { log::warn!("[VFS miss] {}", abs); ctx.vfs_misses.push(abs.clone()); -ENOENT }
             }
         }
         SYS_LSTAT => {
@@ -426,7 +426,7 @@ pub fn handle_syscall(
                     write_stat(mem, a2, ctx.vfs.mem.node(ino).stat.clone())?;
                     0
                 }
-                Err(_) => { ctx.vfs_misses.push(abs.clone()); -ENOENT }
+                Err(_) => { log::warn!("[VFS miss] {}", abs); ctx.vfs_misses.push(abs.clone()); -ENOENT }
             }
         }
 
@@ -608,7 +608,7 @@ pub fn handle_syscall(
             let abs  = resolve_path(&ctx.cwd, &path);
             match ctx.vfs.mem.lookup(&abs) {
                 Ok(_) => 0,
-                Err(_) => { ctx.vfs_misses.push(abs.clone()); -ENOENT }
+                Err(_) => { log::warn!("[VFS miss] {}", abs); ctx.vfs_misses.push(abs.clone()); -ENOENT }
             }
         }
 

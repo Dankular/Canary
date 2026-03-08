@@ -834,7 +834,7 @@ impl CanaryRuntime {
         let start_pc = self.arm_cpu.as_ref().map(|a| a.pc).unwrap_or(self.cpu.rip);
         log(&format!("Canary: executing from {:#x}", start_pc));
         loop {
-            match self.step_once() {
+        match self.step_once() {
                 Ok(()) => {}
                 Err(CanaryError::Exit(code)) => return Ok(code),
                 Err(e) => return Err(e),
@@ -966,7 +966,7 @@ impl CanaryRuntime {
                 JitResult::Branch(_)    => Ok(()),
                 JitResult::Syscall(_)   => self.dispatch_syscall(),
                 JitResult::Halt         => Err(CanaryError::Exit(0)),
-                JitResult::Fault(e)     => Err(CanaryError::Exec(e)),
+                JitResult::Fault(e)     => Err(CanaryError::Exec(format!("{e} @{rip:#x}"))),
             };
         }
 
@@ -1035,7 +1035,7 @@ impl CanaryRuntime {
                 Ok(())
             }
             Err(ExecError::IoPort { .. }) => Ok(()), // unexpected dir value — ignore
-            Err(e) => Err(CanaryError::Exec(e.to_string())),
+            Err(e) => Err(CanaryError::Exec(format!("{e} @{rip:#x}"))),
         }
     }
 
@@ -1397,7 +1397,42 @@ impl CanaryRuntime {
             Ok(())                    => true,
             Err(CanaryError::Exit(_)) => false,
             Err(e) => {
+                use canary_cpu::registers::reg;
+                let rip = self.cpu.rip;
+                let rax = self.cpu.gpr[reg::RAX];
+                let rbx = self.cpu.gpr[reg::RBX];
+                let rcx = self.cpu.gpr[reg::RCX];
+                let rdx = self.cpu.gpr[reg::RDX];
+                let rsi = self.cpu.gpr[reg::RSI];
+                let rdi = self.cpu.gpr[reg::RDI];
+                let rbp = self.cpu.gpr[reg::RBP];
+                let rsp = self.cpu.gpr[reg::RSP];
+                let r8  = self.cpu.gpr[reg::R8];
+                let r9  = self.cpu.gpr[reg::R9];
+                let r10 = self.cpu.gpr[reg::R10];
+                let r11 = self.cpu.gpr[reg::R11];
+                let r12 = self.cpu.gpr[reg::R12];
+                let r13 = self.cpu.gpr[reg::R13];
+                let r14 = self.cpu.gpr[reg::R14];
+                let r15 = self.cpu.gpr[reg::R15];
+                // Auto-recover from null-page faults (fault addr < 0x10000)
+                if let Some(fa) = null_fault_addr(&e) {
+                    if fa < 0x10000 {
+                        if let Ok(bytes) = self.mem.read_bytes_copy(rip, 15) {
+                            if let Some((ilen, dreg)) = decode_x86_load(&bytes) {
+                                log::warn!("[null-deref] @{:#x} fault={:#x} skip={} dest={:?}", rip, fa, ilen, dreg);
+                                if let Some(r) = dreg { self.cpu.gpr[r] = 0; }
+                                self.cpu.rip += ilen as u64;
+                                return true;
+                            }
+                        }
+                    }
+                }
                 error(&format!("Canary step error: {e}"));
+                error(&format!("  rip={rip:#x} rax={rax:#x} rbx={rbx:#x} rcx={rcx:#x} rdx={rdx:#x}"));
+                error(&format!("  rsi={rsi:#x} rdi={rdi:#x} rbp={rbp:#x} rsp={rsp:#x}"));
+                error(&format!("  r8={r8:#x} r9={r9:#x} r10={r10:#x} r11={r11:#x}"));
+                error(&format!("  r12={r12:#x} r13={r13:#x} r14={r14:#x} r15={r15:#x}"));
                 false
             }
         }
@@ -1409,6 +1444,107 @@ impl CanaryRuntime {
 /// Minimal logger that forwards `log::error!` / `log::warn!` to the browser
 /// DevTools console.  Uses the JS `console.error` / `console.warn` bindings
 /// already declared at the top of this file.
+
+// x86-64 null-deref recovery helpers
+
+fn null_fault_addr(e: &CanaryError) -> Option<u64> {
+    let s = e.to_string();
+    let marker = "address 0x";
+    let start = s.find(marker)? + marker.len();
+    let end = s[start..].find(|c: char| !c.is_ascii_hexdigit())? + start;
+    u64::from_str_radix(&s[start..end], 16).ok()
+}
+
+/// Decode an x86-64 instruction that faults on a null-page access.
+/// Returns (instruction_len, dest_gpr) where dest_gpr is the GPR that receives
+/// a loaded value (zero it on null-deref), or None if memory is the destination.
+fn decode_x86_load(bytes: &[u8]) -> Option<(usize, Option<usize>)> {
+    use canary_cpu::registers::reg;
+    let mut pos = 0usize;
+    let mut rex_r = false;
+    let mut opsz_16 = false;
+
+    // Consume legacy prefixes
+    loop {
+        if pos >= bytes.len() { return None; }
+        match bytes[pos] {
+            0x40..=0x4F => { rex_r = (bytes[pos] & 0x04) != 0; pos += 1; }
+            0x66 => { opsz_16 = true; pos += 1; }
+            0x26|0x2E|0x36|0x3E|0x64|0x65|0x67 => { pos += 1; }
+            _ => break,
+        }
+    }
+    if pos >= bytes.len() { return None; }
+    let opcode = bytes[pos]; pos += 1;
+
+    // Two-byte opcode escape
+    let (opcode2, two_byte) = if opcode == 0x0F {
+        if pos >= bytes.len() { return None; }
+        let op2 = bytes[pos]; pos += 1;
+        (op2, true)
+    } else {
+        (0u8, false)
+    };
+
+    // Decode ModRM + SIB + displacement, return updated pos and optional dest reg.
+    // reg_is_dest: true  -> the reg field of ModRM is the GPR destination (zero it)
+    //              false -> memory is destination (no GPR to zero)
+    let decode_modrm = |mut p: usize, reg_is_dest: bool| -> Option<(usize, Option<usize>)> {
+        if p >= bytes.len() { return None; }
+        let modrm = bytes[p]; p += 1;
+        let modv = (modrm >> 6) & 3;
+        let regv = ((modrm >> 3) & 7) | if rex_r { 8 } else { 0 };
+        let rmv  = modrm & 7;
+        let dest = if reg_is_dest { Some(match regv {
+            0=>reg::RAX, 1=>reg::RCX, 2=>reg::RDX,  3=>reg::RBX,
+            4=>reg::RSP, 5=>reg::RBP, 6=>reg::RSI,  7=>reg::RDI,
+            8=>reg::R8,  9=>reg::R9,  10=>reg::R10, 11=>reg::R11,
+            12=>reg::R12,13=>reg::R13,14=>reg::R14, 15=>reg::R15,
+            _ => return None,
+        }) } else { None };
+        if modv != 3 && rmv == 4 { if p >= bytes.len() { return None; } p += 1; }
+        match modv {
+            0 => { if rmv == 5 { p += 4; } }
+            1 => { p += 1; }
+            2 => { p += 4; }
+            _ => {}
+        }
+        Some((p, dest))
+    };
+
+    if !two_byte {
+        match opcode {
+            // MOV r, [mem] -- reg gets loaded value, zero it
+            0x8A | 0x8B => decode_modrm(pos, true),
+            // MOV [mem], r -- memory is target, no reg to zero
+            0x88 | 0x89 => decode_modrm(pos, false).map(|(p, _)| (p, None)),
+            // Group 1: ADD/OR/ADC/SBB/AND/SUB/XOR/CMP  rm, imm
+            0x80 | 0x82 => decode_modrm(pos, false).map(|(p, _)| (p + 1, None)),
+            0x83         => decode_modrm(pos, false).map(|(p, _)| (p + 1, None)),
+            0x81         => decode_modrm(pos, false).map(|(p, _)| (p + if opsz_16 { 2 } else { 4 }, None)),
+            // CMP/TEST rm, r
+            0x38|0x39|0x3A|0x3B|0x84|0x85 => decode_modrm(pos, false).map(|(p,_)| (p, None)),
+            // Arithmetic reg, [mem]: ADD OR ADC SBB AND SUB XOR
+            0x02|0x03|0x0A|0x0B|0x12|0x13|0x1A|0x1B|
+            0x22|0x23|0x2A|0x2B|0x32|0x33 => decode_modrm(pos, true),
+            // XCHG, LEA
+            0x86|0x87 => decode_modrm(pos, false).map(|(p,_)| (p, None)),
+            0x8D      => decode_modrm(pos, true),
+            _ => None,
+        }
+    } else {
+        match opcode2 {
+            // MOVZX / MOVSX
+            0xB6|0xB7|0xBE|0xBF => decode_modrm(pos, true),
+            // CMOV
+            0x40..=0x4F => decode_modrm(pos, true),
+            // BSF / BSR
+            0xBC|0xBD => decode_modrm(pos, true),
+            _ => None,
+        }
+    }
+}
+
 struct ConsoleLogger;
 
 impl log::Log for ConsoleLogger {
