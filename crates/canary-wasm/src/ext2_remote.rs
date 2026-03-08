@@ -624,4 +624,69 @@ impl RemoteExt2 {
         }
         true
     }
+
+    /// Resolve `path` by walking the ext2 directory tree one component at a
+    /// time, fetching only the inodes on the path.  Returns the inode number
+    /// of the final component if found, `None` otherwise.
+    ///
+    /// This is orders of magnitude cheaper than `populate_memfs` when you only
+    /// need a single file — it fetches O(depth) inodes instead of O(filesystem).
+    pub async fn lookup_path(&mut self, path: &str) -> Option<u32> {
+        // Start from inode 2 (ext2 root directory).
+        let mut cur_ino: u32 = 2;
+
+        let components: Vec<&str> = path
+            .trim_start_matches('/')
+            .split('/')
+            .filter(|c| !c.is_empty())
+            .collect();
+
+        if components.is_empty() {
+            // Caller asked for root — return root inode.
+            return Some(cur_ino);
+        }
+
+        for (i, component) in components.iter().enumerate() {
+            let inode_data = self.get_inode(cur_ino).await?;
+            let dir_data   = self.read_inode_data(&inode_data).await;
+            let entries    = Self::parse_dir_data(&dir_data);
+
+            // Find this component in the directory.
+            let found = entries.into_iter().find(|(name, _, _)| name == component);
+            let (_, child_ino, file_type) = found?;
+
+            let is_last = i == components.len() - 1;
+
+            if is_last {
+                return Some(child_ino);
+            }
+
+            // Must be a directory (or symlink we'll treat as opaque) to descend.
+            if file_type == 2 {
+                cur_ino = child_ino;
+            } else if file_type == 7 {
+                // Symlink — resolve relative to parent and restart.
+                let link_inode = self.get_inode(child_ino).await?;
+                let target_bytes = self.read_inode_data(&link_inode).await;
+                let target = String::from_utf8_lossy(&target_bytes).into_owned();
+                // Only handle absolute symlinks for now; relative ones are rare in /usr paths.
+                if target.starts_with('/') {
+                    // Recurse into the resolved absolute target + remaining components.
+                    let remaining = components[i+1..].join("/");
+                    let resolved = if remaining.is_empty() {
+                        target
+                    } else {
+                        format!("{target}/{remaining}")
+                    };
+                    return Box::pin(self.lookup_path(&resolved)).await;
+                }
+                return None;
+            } else {
+                return None;
+            }
+        }
+
+        Some(cur_ino)
+    }
+
 }

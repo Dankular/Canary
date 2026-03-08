@@ -150,6 +150,8 @@ pub struct SyscallCtx {
     pub input: canary_input::InputCtx,
     /// Path of the main executable (returned by readlink("/proc/self/exe")).
     pub proc_exe: String,
+    /// Paths that triggered ENOENT — drained by JS to lazily fetch missing files.
+    pub vfs_misses: Vec<String>,
 }
 
 impl SyscallCtx {
@@ -187,6 +189,7 @@ impl SyscallCtx {
             io:            canary_io::IoCtx::new(),
             input:         canary_input::InputCtx::new(),
             proc_exe:      String::new(),
+            vfs_misses:    Vec::new(),
         }
     }
 }
@@ -307,7 +310,7 @@ pub fn handle_syscall(
                     let fd = ctx.fds.alloc(ino, flags);
                     fd as i64
                 }
-                Err(_) => -ENOENT,
+                Err(_) => { ctx.vfs_misses.push(abs.clone()); -ENOENT }
             }
         }
 
@@ -344,7 +347,7 @@ pub fn handle_syscall(
                     let fd = ctx.fds.alloc(ino, flags);
                     fd as i64
                 }
-                Err(_) => -ENOENT,
+                Err(_) => { ctx.vfs_misses.push(abs.clone()); -ENOENT }
             }
         }
 
@@ -381,7 +384,7 @@ pub fn handle_syscall(
                     write_stat(mem, a1, ctx.vfs.mem.node(ino).stat.clone())?;
                     0
                 }
-                Err(_) => -ENOENT,
+                Err(_) => { ctx.vfs_misses.push(abs.clone()); -ENOENT }
             }
         }
         SYS_LSTAT => {
@@ -405,7 +408,7 @@ pub fn handle_syscall(
                     write_stat(mem, a1, ctx.vfs.mem.node(ino).stat.clone())?;
                     0
                 }
-                None => -ENOENT,
+                None => { ctx.vfs_misses.push(abs.clone()); -ENOENT }
             }
         }
         SYS_FSTAT => {
@@ -423,7 +426,7 @@ pub fn handle_syscall(
                     write_stat(mem, a2, ctx.vfs.mem.node(ino).stat.clone())?;
                     0
                 }
-                Err(_) => -ENOENT,
+                Err(_) => { ctx.vfs_misses.push(abs.clone()); -ENOENT }
             }
         }
 
@@ -605,7 +608,7 @@ pub fn handle_syscall(
             let abs  = resolve_path(&ctx.cwd, &path);
             match ctx.vfs.mem.lookup(&abs) {
                 Ok(_) => 0,
-                Err(_) => -ENOENT,
+                Err(_) => { ctx.vfs_misses.push(abs.clone()); -ENOENT }
             }
         }
 
@@ -650,7 +653,7 @@ pub fn handle_syscall(
                 None => {
                     // Path exists but is not a symlink → EINVAL; not found → ENOENT.
                     let exists = ctx.vfs.mem.lookup(&abs).is_ok();
-                    if exists { -EINVAL } else { -ENOENT }
+                    if exists { -EINVAL } else { ctx.vfs_misses.push(abs.clone()); -ENOENT }
                 }
             }
         }

@@ -104,6 +104,43 @@ pub async fn fetch_ext2_file(path: String) -> Result<js_sys::Uint8Array, JsValue
     Ok(js_sys::Uint8Array::from(data.as_slice()))
 }
 
+/// Look up a single path in the ext2 image and return its content.
+///
+/// Unlike `fetch_ext2_file`, this does NOT require the path to have been
+/// indexed during `stage_vfs_from_url` — it walks the directory tree on
+/// demand starting from the ext2 root.
+///
+/// Returns `undefined` (not an error) if the path does not exist in the image.
+#[wasm_bindgen]
+pub async fn lookup_ext2_path(path: String) -> Result<js_sys::Uint8Array, JsValue> {
+    // Try the fast path first: already indexed by stage_vfs_from_url.
+    let ino_cached = EXT2_INODE_MAP.with(|m| m.borrow().get(&path).copied());
+
+    let mut reader = EXT2_READER.with(|r| r.borrow_mut().take())
+        .ok_or_else(|| JsValue::from_str("lookup_ext2_path: ext2 reader not available"))?;
+
+    let result = if let Some(ino) = ino_cached {
+        reader.fetch_file(ino).await
+    } else {
+        // Walk from root to resolve this specific path.
+        match reader.lookup_path(&path).await {
+            Some(ino) => {
+                // Cache for future calls.
+                EXT2_INODE_MAP.with(|m| m.borrow_mut().insert(path.clone(), ino));
+                reader.fetch_file(ino).await
+            }
+            None => None,
+        }
+    };
+
+    EXT2_READER.with(|r| *r.borrow_mut() = Some(reader));
+
+    match result {
+        Some(data) => Ok(js_sys::Uint8Array::from(data.as_slice())),
+        None => Ok(js_sys::Uint8Array::new_with_length(0)),
+    }
+}
+
 // ── Canary runtime ────────────────────────────────────────────────────────────
 
 #[wasm_bindgen]
@@ -274,6 +311,17 @@ impl CanaryRuntime {
     #[wasm_bindgen]
     pub fn drain_stderr(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.ctx.stderr_buf)
+    }
+
+    /// Drain the list of paths that triggered ENOENT since the last call.
+    /// The JS harness calls this each frame to lazily fetch missing files.
+    #[wasm_bindgen]
+    pub fn drain_vfs_misses(&mut self) -> js_sys::Array {
+        let arr = js_sys::Array::new();
+        for p in self.ctx.vfs_misses.drain(..) {
+            arr.push(&JsValue::from_str(&p));
+        }
+        arr
     }
 
     /// Write bytes into the stdin buffer.
