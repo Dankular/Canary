@@ -321,6 +321,8 @@ impl RemoteExt2 {
                 let ei_hi = u16le(iblock, off + 8) as u64;
                 index_blocks.push(((ei_hi << 32) | ei_lo) as u32);
             }
+            // Prefetch ALL index blocks in parallel before sequential traversal.
+            self.prefetch_blocks(&index_blocks).await;
             for idx_blk in index_blocks {
                 if let Some(child) = self.fetch_block(idx_blk).await {
                     self.collect_leaf_extents_from_block(&child, &mut leaf_extents).await;
@@ -328,6 +330,13 @@ impl RemoteExt2 {
             }
         }
 
+        // Prefetch all leaf content blocks in one parallel batch.
+        {
+            let all_leaf_blocks: Vec<u32> = leaf_extents.iter()
+                .flat_map(|&(phys_start, len)| (0..len).map(move |j| (phys_start + j as u64) as u32))
+                .collect();
+            self.prefetch_blocks(&all_leaf_blocks).await;
+        }
         // Materialise file content from the ordered leaf extents.
         let mut out       = Vec::with_capacity(file_size.min(MAX_FILE_BYTES));
         let mut remaining = file_size;
@@ -378,6 +387,8 @@ impl RemoteExt2 {
                 let ei_hi = u16le(block_data, off + 8) as u64;
                 child_blocks.push(((ei_hi << 32) | ei_lo) as u32);
             }
+            // Prefetch all child index blocks in parallel.
+            self.prefetch_blocks(&child_blocks).await;
             for child_blk in child_blocks {
                 if let Some(child_data) = self.fetch_block(child_blk).await {
                     // Only process leaves (depth 0); deeper nesting is not needed
