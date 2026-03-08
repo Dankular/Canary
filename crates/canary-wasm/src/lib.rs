@@ -58,17 +58,15 @@ pub async fn stage_vfs_from_url(url: String) -> Result<(), JsValue> {
             "stage_vfs_from_url: failed to read ext2 superblock — check URL and server Range support",
         ));
     }
-    log("Canary: ext2 superblock parsed, traversing filesystem…");
 
-    let mut staging_fs = canary_fs::MemFs::new();
-    let mut inode_map  = HashMap::<String, u32>::new();
-    if !reader.populate_memfs(&mut staging_fs, &mut inode_map).await {
-        return Err(JsValue::from_str(
-            "stage_vfs_from_url: filesystem traversal failed",
-        ));
-    }
+    // Lazy VFS: skip full traversal entirely.  Files are resolved on demand via
+    // lookup_ext2_path() as ENOENT misses are reported by the syscall layer.
+    // This reduces initial load from minutes (full 10 GB scan) to < 1 second.
+    log("Canary: ext2 superblock parsed — lazy VFS mode, skipping full traversal.");
 
-    log(&format!("Canary: ext2 traversal complete — {} paths indexed, VFS staged", inode_map.len()));
+    let staging_fs = canary_fs::MemFs::new();
+    let inode_map  = HashMap::<String, u32>::new();
+
     VFS_STAGING.with(|cell| { *cell.borrow_mut() = Some(staging_fs); });
     EXT2_INODE_MAP.with(|cell| { *cell.borrow_mut() = inode_map; });
     EXT2_READER.with(|cell| { *cell.borrow_mut() = Some(reader); });
