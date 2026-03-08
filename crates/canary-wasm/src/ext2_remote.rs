@@ -217,6 +217,13 @@ impl RemoteExt2 {
         let mut out       = Vec::with_capacity(file_size.min(MAX_FILE_BYTES));
         let mut remaining = file_size;
 
+        // Prefetch direct blocks in parallel before reading.
+        let direct: Vec<u32> = (0..12usize)
+            .map(|i| u32le(iblock, i * 4))
+            .take_while(|&b| b != 0)
+            .collect();
+        self.prefetch_blocks(&direct).await;
+
         // Direct blocks i_block[0..11]
         for i in 0..12usize {
             if remaining == 0 { break; }
