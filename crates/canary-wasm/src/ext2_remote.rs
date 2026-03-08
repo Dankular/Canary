@@ -681,7 +681,7 @@ impl RemoteExt2 {
             let found = entries.into_iter().find(|(name, _, _)| name == component);
             let (_, child_ino, file_type) = found?;
 
-            let is_last = i == components.len() - 1;
+            let is_last = abs_i == components.len() - 1;
 
             if is_last {
                 return Some(child_ino);
