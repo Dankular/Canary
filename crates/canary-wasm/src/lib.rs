@@ -812,6 +812,15 @@ impl CanaryRuntime {
         let stack = build_initial_stack(layout::STACK_TOP, &argv_refs, &envp_refs, &auxv, [0u8; 16]);
         self.mem.loader_write(stack.rsp, &stack.data);
 
+        // ── Map null page as zero-filled ──────────────────────────────────
+        // ld-linux accesses its own GOT entries before self-relocation
+        // completes; pre-relocation GOT values are small addends (e.g. 0x30,
+        // 0x355, 0x400) that get used as pointers, causing faults in the null
+        // page.  Mapping zeros here lets ld-linux read null/zero values and
+        // handle them with its own null-pointer guards, instead of triggering
+        // our null-deref recovery which can corrupt registers.
+        self.mem.loader_write(0, &vec![0u8; 0x10000]);
+
         // ── 8. Position CPU at entry point (ready for step()) ─────────────
         if is_aarch64 {
             let mut acpu = ArmCpuState::default();
