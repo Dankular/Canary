@@ -819,7 +819,11 @@ impl CanaryRuntime {
         // page.  Mapping zeros here lets ld-linux read null/zero values and
         // handle them with its own null-pointer guards, instead of triggering
         // our null-deref recovery which can corrupt registers.
-        self.mem.loader_write(0, &vec![0u8; 0x10000]);
+        // Must use mmap(FIXED) so both the page-table frame AND the Mapping
+        // entry are registered (loader_write only adds the frame).
+        let _ = self.mem.mmap(0, 0x10000,
+                              Prot::READ | Prot::WRITE,
+                              MapFlags::FIXED | MapFlags::PRIVATE | MapFlags::ANONYMOUS);
 
         // ── 8. Position CPU at entry point (ready for step()) ─────────────
         if is_aarch64 {
