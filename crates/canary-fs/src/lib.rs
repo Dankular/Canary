@@ -10,6 +10,30 @@ pub mod ext2;
 use thiserror::Error;
 use std::collections::HashMap;
 
+// ── Advertised system info ──────────────────────────────────────────────────
+
+/// Default RAM figure advertised to the guest via `sysinfo(2)` and
+/// `/proc/meminfo`.  Wine, DXVK, and games read this to size caches and
+/// texture-streaming budgets.
+///
+/// This is advertisement, not reservation — `GuestMemory` (canary-memory) is
+/// a software page table that allocates one 4 KiB physical frame per guest
+/// page actually touched, so nothing is pre-committed. But it is NOT free to
+/// inflate: every touched frame still has to fit in the *one* linear memory
+/// backing the whole Canary WASM instance (guest pages + Rust heap + JIT
+/// cache + wasm-bindgen tables, all sharing it), and on today's standard
+/// (wasm32) build that instance is hard-capped at 4 GiB by the WASM spec
+/// itself. Advertising more than that just invites the guest to allocate
+/// past the real ceiling, which aborts the whole instance instead of
+/// failing one allocation inside it — worse than under-advertising.
+///
+/// 3 GiB leaves headroom under the 4 GiB ceiling for everything else sharing
+/// that memory. Raise it with `CanaryRuntime::set_guest_ram_bytes()` only
+/// once the browser is verified to actually back more (see
+/// harness/memory64.mjs in WebX, and `docs/memory64-status.md` in this repo
+/// for why a genuine >4 GiB build isn't possible yet).
+pub const DEFAULT_TOTAL_RAM_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+
 // ── Errors ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Error)]
@@ -328,10 +352,21 @@ impl Vfs {
         let _ = self.mem.write_file("/proc/self/status", b"Name:\tcanary\nPid:\t1\n".to_vec());
         let _ = self.mem.write_file("/proc/cpuinfo",
             b"processor\t: 0\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 15\n".to_vec());
-        let _ = self.mem.write_file("/proc/meminfo",
-            b"MemTotal:\t3145728 kB\nMemFree:\t2097152 kB\n".to_vec());
+        self.write_meminfo(DEFAULT_TOTAL_RAM_BYTES, DEFAULT_TOTAL_RAM_BYTES * 2 / 3);
         let _ = self.mem.write_file("/proc/version",
             b"Linux version 5.15.0-canary (canary@build) (gcc 12.0)\n".to_vec());
+    }
+
+    /// (Re)write `/proc/meminfo` to advertise `total_bytes` of RAM, with
+    /// `free_bytes` reported as currently available. Callable at any time —
+    /// used both for the boot-time default and for a JS-driven runtime
+    /// override (see `CanaryRuntime::set_guest_ram_bytes`).
+    pub fn write_meminfo(&mut self, total_bytes: u64, free_bytes: u64) {
+        let total_kb = total_bytes / 1024;
+        let free_kb  = free_bytes  / 1024;
+        let _ = self.mem.write_file("/proc/meminfo", format!(
+            "MemTotal:\t{total_kb} kB\nMemFree:\t{free_kb} kB\nMemAvailable:\t{free_kb} kB\n"
+        ).into_bytes());
     }
 
     fn setup_dev(&mut self) {
