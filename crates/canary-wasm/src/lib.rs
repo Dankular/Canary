@@ -209,6 +209,29 @@ impl CanaryRuntime {
         self.ctx.vfs.mem.write_file(path, data.to_vec()).ok();
     }
 
+    /// Set the RAM figure advertised to the guest via sysinfo(2) and
+    /// `/proc/meminfo` (Wine/DXVK/VKD3D and games read this to size caches
+    /// and texture-streaming budgets). This is advertisement only — it does
+    /// not pre-allocate backing memory; `GuestMemory` allocates one 4 KiB
+    /// physical frame per guest page actually touched, regardless of this
+    /// figure. Call before `prepare_elf()` / `step()` for the guest to see
+    /// it from boot.
+    ///
+    /// Do NOT set this above what the host WASM instance can actually back
+    /// (today: ~3.5 GiB, leaving headroom under the 4 GiB wasm32 ceiling
+    /// shared with the Rust heap/JIT cache/wasm-bindgen tables) — the guest
+    /// would be invited to allocate past the real limit, which aborts the
+    /// whole instance rather than failing one allocation inside it. See
+    /// docs/memory64-status.md for why a genuine >4 GiB build isn't
+    /// possible yet (wasm-bindgen has no wasm64 support, and browsers cap
+    /// memory64 at 4 GiB for web content regardless). The JS harness
+    /// (harness/memory64.mjs in WebX) probes the browser and only raises
+    /// this once both of those are actually true.
+    #[wasm_bindgen]
+    pub fn set_guest_ram_bytes(&mut self, bytes: u64) {
+        self.ctx.set_guest_ram_bytes(bytes);
+    }
+
     /// Read a file from the virtual filesystem.
     /// Returns the file content as a Uint8Array, or null if not found.
     #[wasm_bindgen]

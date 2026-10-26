@@ -152,6 +152,10 @@ pub struct SyscallCtx {
     pub proc_exe: String,
     /// Paths that triggered ENOENT — drained by JS to lazily fetch missing files.
     pub vfs_misses: Vec<String>,
+    /// RAM figure advertised to the guest via sysinfo(2) / `/proc/meminfo`.
+    /// See `canary_fs::DEFAULT_TOTAL_RAM_BYTES` for why a generous default is
+    /// safe (backing frames are allocated lazily, not up front).
+    pub guest_ram_bytes: u64,
 }
 
 impl SyscallCtx {
@@ -190,7 +194,17 @@ impl SyscallCtx {
             input:         canary_input::InputCtx::new(),
             proc_exe:      String::new(),
             vfs_misses:    Vec::new(),
+            guest_ram_bytes: canary_fs::DEFAULT_TOTAL_RAM_BYTES,
         }
+    }
+
+    /// Update the RAM figure advertised to the guest via sysinfo(2) and
+    /// `/proc/meminfo`. Does not pre-allocate backing memory. Call before
+    /// the guest's first sysinfo/meminfo read (i.e. before `prepare_elf()`
+    /// / `step()`) for it to take effect from boot.
+    pub fn set_guest_ram_bytes(&mut self, bytes: u64) {
+        self.guest_ram_bytes = bytes;
+        self.vfs.write_meminfo(bytes, bytes * 2 / 3);
     }
 }
 
@@ -938,15 +952,19 @@ pub fn handle_syscall(
 
         // ── sysinfo ───────────────────────────────────────────────────────
         SYS_SYSINFO => {
-            // struct sysinfo (simplified)
-            mem.write_u64(a0,       86400)?;        // uptime
-            mem.write_u64(a0 + 8,  0xC000_0000)?;  // totalram
-            mem.write_u64(a0 + 16, 0x8000_0000)?;  // freeram
-            mem.write_u64(a0 + 24, 0)?;             // sharedram
-            mem.write_u64(a0 + 32, 0)?;             // bufferram
-            mem.write_u64(a0 + 40, 0xC000_0000)?;  // totalswap
-            mem.write_u64(a0 + 48, 0xC000_0000)?;  // freeswap
-            mem.write_u16(a0 + 56, 1)?;             // procs
+            // struct sysinfo (simplified) — totalram reflects the advertised
+            // guest RAM figure (see SyscallCtx::guest_ram_bytes), not any
+            // actual pre-committed allocation.
+            let total = ctx.guest_ram_bytes;
+            let free  = total * 2 / 3;
+            mem.write_u64(a0,       86400)?;  // uptime
+            mem.write_u64(a0 + 8,   total)?;  // totalram
+            mem.write_u64(a0 + 16,  free)?;   // freeram
+            mem.write_u64(a0 + 24, 0)?;       // sharedram
+            mem.write_u64(a0 + 32, 0)?;       // bufferram
+            mem.write_u64(a0 + 40, total)?;   // totalswap
+            mem.write_u64(a0 + 48, total)?;   // freeswap
+            mem.write_u16(a0 + 56, 1)?;       // procs
             0
         }
 

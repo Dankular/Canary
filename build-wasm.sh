@@ -30,5 +30,14 @@ else
 fi
 
 echo ""
+echo "==> Skipping memory64/wasm64 build: not currently possible."
+echo "    See docs/memory64-status.md — the core emulator (canary-memory,"
+echo "    canary-cpu, ...) compiles fine for the wasm64-unknown-unknown"
+echo "    target, but wasm-bindgen 0.2.111's JS-interop codegen is hardcoded"
+echo "    to target_arch = \"wasm32\" and silently no-ops on wasm64, so a"
+echo "    wasm64 build of canary-wasm produces a module with no usable JS"
+echo "    exports. Revisit once wasm-bindgen supports wasm64 upstream."
+
+echo ""
 echo "==> Standard build complete → $CRATE_DIR/pkg/"
 echo "==> Start dev server: node harness/server.mjs"
